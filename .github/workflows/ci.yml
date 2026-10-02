@@ -26,9 +26,11 @@ jobs:
 
       - uses: pnpm/action-setup@v4
 
+      # 工具链固定 22：pnpm 11.7 要求 Node ≥ 22.13（它 import `node:sqlite`）。
+      # 这里原先直接用矩阵版本，于是 node 20 那条腿连 setup-node 的 pnpm 缓存步骤都过不去。
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '22'
           cache: pnpm
 
       # lockfile 已提交（协议包 `dsh-remote-wire@1.0.0` 上了 npm 之后生成的），所以冻结安装。
@@ -36,14 +38,27 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # 静态检查跑一次就够，两条腿重复跑没有额外信息。
       - name: Type-check
+        if: matrix.node == '22'
         run: pnpm typecheck
 
       - name: Format check
+        if: matrix.node == '22'
         run: pnpm format:check
 
-      - name: Build + tests
-        run: pnpm test
+      - name: Build
+        run: pnpm build
+
+      # engines 写的是 >=20，那就得真在 20 上把测试跑一遍。测试是普通 JS
+      # （`node --test tests/*.test.mjs`，只是 import ../dist/src/*.js），不经 pnpm，
+      # 所以这里可以把 node 切成矩阵版本。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run tests on node ${{ matrix.node }}
+        run: node --test "tests/*.test.mjs"
 
   # 部署形态的机械防线：在**最低支持版本**上把单文件产物拷进一个空目录，真起一次，
   # 断言 /healthz 的 version 等于包版本、SIGTERM 退出码为 0。这条独立于测试套件，
@@ -56,9 +71,11 @@ jobs:
 
       - uses: pnpm/action-setup@v4
 
+      # 装与打包用 22（pnpm 11.7 的下限），**跑产物**才切到最低支持版本 20——
+      # 这条 job 要证明的是"一个文件在 node 20 上能跑"，不是"pnpm 能在 20 上装"。
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: pnpm
 
       # 同 test job：lockfile 已提交，冻结安装。
@@ -67,6 +84,10 @@ jobs:
 
       - name: Build the single-file artifact
         run: pnpm build
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Run it from an empty directory
         run: |
