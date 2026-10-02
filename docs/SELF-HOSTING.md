@@ -190,18 +190,64 @@ curl -s http://127.0.0.1:8787/healthz
 | `clients`       | number | ✅ 契约      | 当前在册客户端数                                                                                                                                   |
 | `conversations` | number | ✅ 契约      | 活跃会话（配对通道）数                                                                                                                             |
 | `pendingPairs`  | number | ✅ 契约      | 待配对表条数。**注意**：已用过的码在 TTL 窗口内仍留在表里（为的是给出 `already_used` 而不是 `invalid_or_expired`），所以这个数会短暂高于你的直觉   |
+| `droppedFrames` | number | ✅ 契约      | 累计：因对端缓冲区超限而被丢的帧数（只增不减）                                                                                                     |
+| `slowConsumers` | number | ✅ 契约      | 累计：被以 1008 `slow_consumer` 断开的对端数（只增不减）                                                                                           |
+| `rejectedPairs` | number | ✅ 契约      | 累计：被拒的配对请求数（只增不减）                                                                                                                 |
+| `lastPingAgo`   | number | ✅ 契约      | **秒**。距上一次保活 ping 扫描多久；`-1` = 还没扫过。单位是秒不是毫秒，看指标时别按 ms 判                                                          |
 | `shuttingDown`  | bool   | ✅ 契约      | 收到 SIGTERM/SIGINT 后置位                                                                                                                         |
 
-这八个字段就是运维契约，`tests/relay.test.mjs` 里有一条断言逐个字段钉住。 **[已验证]**
+这 12 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
+`rejectedPairs` 是**累计计数**（只增不减），混在一起会让"手机不更新"这类排查分不清
+"现在是空的"和"一直送不出去"。 **[已验证：`curl` 实测响应 + 代码 `health()`]**
 
-`/healthz` 现在**只有上面八个字段**——`lastPingAgo` / `droppedFrames` / `slowConsumers`
-都不存在，别把告警规则写在它们身上。 **[已验证：代码 + 本次实测响应]**
+> 本节此前写作"八个字段"并断言 `lastPingAgo`/`droppedFrames`/`slowConsumers` **不存在**——
+> 那是在 C0 压测装置拿这三类字段做过采样之后被推翻的：响应里一直都有，
+> 而且 `tests/relay.test.mjs` 早就在读 `droppedFrames`/`slowConsumers`/`rejectedPairs`。
+> 告警可以写在它们身上。
 
 `/healthz`、`/api/info`、`/api/pair-status` 之外的路径一律 404 + `{"error":"not_found"}`。
 
 `ok` 适合做存活探针，但要清楚：停机时 `http.close()` 会**立刻关掉监听套接字**，
 探针更常见的表现是连不上（ECONNREFUSED），而不是拿到一个 `ok:false` 的响应
 （`shuttingDown:true` 只在已经建立的连接上读得到）。按"连不上=正在重启"来写探针。 **[未实测]**
+
+### 4.1 容量基线（实测：挂着不动的连接）
+
+`scripts/loadtest-conns.mjs` 起一个本地中继（跑的就是上面那个单文件产物），开 N 条
+只走完 `hello`/`hello-ok` 然后不发任何业务帧的 ws，每 5 s 从**进程外部**采一轮：
+
+```sh
+pnpm build
+node scripts/loadtest-conns.mjs --n=10000 --seconds=30
+# CSV 与中继日志落在 data/loadtest/（已 gitignore）
+```
+
+2026-10-03 在 macOS / node v22.23.3 / 8 逻辑核 / 16 GB 上实测（空载 RSS ≈ 57 MB）：
+
+| N（连接数） | 建连用时 | RSS/连接  | fd/连接 | ping 帧/秒 | 出站（WS 帧层） | `/healthz` p50 | 单轮最长阻塞 | 平均 CPU     |
+| ----------- | -------- | --------- | ------- | ---------- | --------------- | -------------- | ------------ | ------------ |
+| 1 000       | 0.1 s    | **11 KB** | 1       | 197        | 0.78 KB/s       | 1 ms           | 6 ms         | ≈0.01 核     |
+| 5 000       | 0.4 s    | **8 KB**  | 1       | 985        | 2.0 KB/s        | 1 ms           | 41 ms        | 0.02 核      |
+| 10 000      | 0.7 s    | **7 KB**  | 1       | 1 960      | 3.9 KB/s        | 1 ms           | **96 ms**    | 0.02–0.07 核 |
+
+读这几行时要带着的四条边界：
+
+1. **"单轮最长阻塞"是 sweep 的代价，用 `/healthz` 应答延迟做代理**——sweep 里那两次全表遍历
+   是同步的，它跑多久 HTTP 应答就被堵多久。10k 时探针看到过 96 ms 的停顿（p50 仍是 1 ms，
+   也就是"每 5 s 堵一下"而不是"一直慢"）。**这一项随 N 近似线性**（6 → 41 → 96 ms）。
+2. **带宽在这里量不出来**。所有连接走 loopback：没有以太网成帧、MTU 16 384，
+   所以数出来的是 **WS 帧层的 2 B/ping**（服务端→客户端的 ping 不掩码、无载荷）。
+   真链路上每条 ping 还要吃 ~42 B 的 IP+TCP 头，外加对端一个 ~54–64 B 的 ACK，
+   于是 10k/5 s ≈ 2 000 次/秒 ≈ **下行 0.67 Mbps、上下行合计约 1.7 Mbps 的纯保活开销**——
+   这句是**解析式，不是实测**，换到真实网卡上必须重测。
+3. **ping 是"一轮全表一次打完"的**：10 000 个 ping 帧整整齐齐落在同一个 5.1 s 窗口里。
+   这就是把心跳分桶的动机——不是省字节，是**别把 2 000 次写挤在同一瞬间**。
+4. **这批数只覆盖"挂着不动"**。业务帧路径（`JSON.parse` + zod 校验 + 成员判定 + 路由 +
+   fanout）一条都没走，所以 `DRC_MAX_FRAMES_PER_SEC` 与全局预算那类阈值
+   **不能从这张表推**，得另做一轮带流量的测量。
+
+对照生产默认值：`DRC_MAX_CONNS=200` 时按 7–11 KB/连接算，路由表本身只占约 1.4–2.2 MB——
+**内存不是这个中继的约束项**。那个默认卡的是"单进程 2 vCPU 上的转发算力"，不是内存。
 
 ---
 
