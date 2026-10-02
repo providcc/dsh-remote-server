@@ -41,6 +41,13 @@ export interface RelayConfig {
   hostGraceMs: number
   /** 清扫与保活周期。调小它可以让"宽限期到期"这类事件更快被观察到（测试需要）。 */
   sweepMs: number
+  /**
+   * 一条连接两次被 ping 之间的目标间隔。心跳**突发**的规模由它和 sweepMs 的关系决定，
+   * 但它**不影响**表清扫的粒度（那仍是 sweepMs）——见 server.ts 的 sweep/sweepPingBucket。
+   */
+  pingIntervalMs: number
+  /** ping 轮转的步长：每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。 */
+  pingTickMs: number
   maxBufferedBytes: number
   /** 慢消费者（发送缓冲持续超限）的判定窗口，按角色分：见 limits.ts 的推导。 */
   slowConsumerHostMs: number
@@ -124,6 +131,8 @@ export function loadConfig(
     conversationIdleTtlMs: integer(env.DRC_CONV_IDLE_TTL_MS, 7 * 24 * 3600 * 1000, 'DRC_CONV_IDLE_TTL_MS'),
     hostGraceMs: integer(env.DRC_HOST_GRACE_MS, 120_000, 'DRC_HOST_GRACE_MS'),
     sweepMs: integer(env.DRC_SWEEP_MS, 5_000, 'DRC_SWEEP_MS'),
+    pingIntervalMs: integer(env.DRC_PING_INTERVAL_MS, 60_000, 'DRC_PING_INTERVAL_MS'),
+    pingTickMs: integer(env.DRC_PING_TICK_MS, 1_000, 'DRC_PING_TICK_MS'),
     maxBufferedBytes: integer(env.DRC_MAX_BUFFERED_BYTES, 1024 * 1024, 'DRC_MAX_BUFFERED_BYTES'),
     slowConsumerHostMs: integer(env.DRC_SLOW_CONSUMER_HOST_MS, HOST_SLOW_CONSUMER_MS, 'DRC_SLOW_CONSUMER_HOST_MS'),
     slowConsumerClientMs: integer(

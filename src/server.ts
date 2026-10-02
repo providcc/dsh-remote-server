@@ -57,6 +57,11 @@ interface Peer {
   /** 对端 socket 缓冲区持续超限的计时（慢消费者处置）；窗口按角色给，见 noteBackpressure。 */
   backpressure: BackpressureGate
   alive: boolean
+  /**
+   * 这条连接属于哪个 ping 桶（见 sweepPingBucket）。建连时按轮转序号取模分配，
+   * **之后不再变**——所以一个对端两次被 ping 的间隔稳定等于 pingIntervalMs。
+   */
+  pingBucket: number
 }
 
 export interface RelayHandle {
@@ -86,7 +91,32 @@ export function createRelay(config: RelayConfig): RelayHandle {
   const peers = new WeakMap<WebSocket, Peer>()
   let shuttingDown = false
   let sweepTimer: NodeJS.Timeout | undefined
+  let pingTimer: NodeJS.Timeout | undefined
   let lastPingAt = 0
+
+  /**
+   * ping 分桶轮转（C1）。桶数 = 心跳周期 / tick，每 tick 只 ping 一个桶。
+   *
+   * 为什么必须**建索引**而不是"每 tick 扫一遍全表挑出这一桶"：那样就把每 5 s 一次的
+   * 10k 次 ping 换成了每秒 10k 次的**遍历**，扫描量反而涨 5 倍——C0 实测那 96 ms 阻塞
+   * 主要来自遍历本身，那样等于没改。
+   * 用 Set 而不是数组：`close` 时要按连接摘除，Set 的 delete 是 O(1)。
+   */
+  const pingBucketCount = Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs))
+  const pingBuckets: Array<Set<Peer>> = Array.from({ length: pingBucketCount }, () => new Set<Peer>())
+  let nextPingBucket = 0
+  let currentPingBucket = 0
+
+  /**
+   * 所有索引都由 `% pingBucketCount` 得出，取不到只可能是代码被改错了。
+   * 这里**宁可抛**，也不要退回一个临时 Set——那等于悄悄丢桶：那批连接从此不再被 ping，
+   * 半开时占着槽位也没人收，而测试里只看得到"心跳好像正常"。
+   */
+  function bucketAt(index: number): Set<Peer> {
+    const bucket = pingBuckets[index]
+    if (!bucket) throw new Error(`ping 桶索引越界：${index} / 共 ${pingBucketCount} 桶`)
+    return bucket
+  }
 
   /**
    * 诊断计数（复核 A8）。`/healthz` 是运维唯一的观测面，而"帧被丢了""谁把谁踢了"
@@ -447,8 +477,13 @@ export function createRelay(config: RelayConfig): RelayHandle {
       pairAttempts: 0,
       backpressure: new BackpressureGate(),
       alive: true,
+      // 轮转序号取模分配：**均匀是刻意的**。哪怕重启风暴里 10k 条连接在几十秒内
+      // 全建起来，它们也会摊到所有桶上；若改成"分给下一个将要轮到的桶"，
+      // 风暴会把它们全塞进同一两个桶，等于把刚拆掉的突发又造回来（C7 的场景）。
+      pingBucket: (nextPingBucket = (nextPingBucket + 1) % pingBucketCount),
     }
     peers.set(ws, peer)
+    bucketAt(peer.pingBucket).add(peer)
     ws.on('message', (raw: RawData, isBinary: boolean) => {
       const verdict = peer.rate.check(Date.now())
       if (!verdict.allowed) {
@@ -516,6 +551,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
     })
     ws.on('close', () => {
       peers.delete(ws)
+      // 必须从桶里摘掉：Set 不摘就永远留着这条 Peer，ping 会继续朝一个已关闭的
+      // socket 发（terminate 过的 ws 再 ping 是抛错被吞掉的），而且 maxConnections
+      // 是按 wss.clients 算的，桶这边就会和闸门慢慢对不上。
+      bucketAt(peer.pingBucket).delete(peer)
       if (peer.role === 'client' && peer.clientId) {
         for (const notice of state.clientGone(peer.clientId, ws)) {
           sendTo(state.hostSocket(notice.conversationId), peerLeftFrame(notice.conversationId, notice.clientId))
@@ -538,25 +577,17 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   // ── 清扫与保活 ──────────────────────────────────────────────────────
 
+  /**
+   * 表清扫：每 `sweepMs`（默认 5 s）一轮，只做与"表项的生命周期"有关的四件事。
+   *
+   * **这一条的周期不能跟着心跳一起变长**（C1 最容易做错的地方）：配对码 TTL 120 s 的
+   * 失效粒度、慢消费者窗口（主机 10 s / 客户端 45 s）、host 宽限期 120 s、会话空闲剪枝，
+   * 全都挂在这个轮次上。把 `DRC_SWEEP_MS` 直接调到 60 s 来"省 ping"会让上面四条
+   * 一起退化成 60 s 粒度——所以拆成两条定时任务，而不是调同一个间隔。
+   */
   function sweep(): void {
     const expired = state.expirePairs()
     if (expired.length > 0) log.debug('pair tokens expired', { count: expired.length })
-    // 保活只走 WS 层 ping：主机与小程序都不发应用层 ping，改判应用层心跳会
-    // 周期性踢掉空闲客户端（取证 relay-and-wireformat.md §5.4）。
-    for (const [ws, peer] of peersOfSockets()) {
-      if (!peer.alive) {
-        log.warn('heartbeat timeout', { clientId: peer.clientId, hostId: peer.hostId })
-        ws.terminate()
-        continue
-      }
-      peer.alive = false
-      try {
-        ws.ping()
-      } catch {
-        /* 已关闭 */
-      }
-    }
-    lastPingAt = Date.now()
     // 慢消费者判定：**定时驱动**，不看这一轮有没有入站帧（见 noteBackpressure 的注释）。
     // 只对 OPEN 的连接读 bufferedAmount——已关闭的连接读它是无意义的。
     const backpressureAt = Date.now()
@@ -576,6 +607,42 @@ export function createRelay(config: RelayConfig): RelayHandle {
     for (const conversationId of state.sweepIdle(config.conversationIdleTtlMs)) {
       log.info('conversation idle-dropped', { sessionId: conversationId })
     }
+  }
+
+  /**
+   * 保活 ping：每 `pingTickMs` 只处理一个桶，一圈 `pingBucketCount` 个桶走完就是
+   * `pingIntervalMs`。C0 实测：10k 连接在旧的"一轮全表 ping"下，10 000 个 ping 帧
+   * 整整齐齐挤在同一个 5 s 窗口里，单轮把事件循环堵住最长 96 ms（p50 仍是 1 ms，
+   * 也就是"每 5 s 堵一下"）。分桶要治的就是这一下，**不是**省字节。
+   *
+   * 判活语义随之变化，而且是变慢的，必须写明白：`alive` 是"上一轮有没有回 pong"的
+   * 单轮标志（这个结构没动，只是换了节奏），所以一条**静默死掉**的对端（没有 FIN/RST
+   * 的半开 socket）要等它自己轮到两次才被发现——第一次清标志并 ping，第二次才发现没 pong。
+   * 最坏因此从 `2×sweepMs`（10 s）变成 `2×pingIntervalMs + pingTickMs`（默认约 121 s）。
+   * 真机上的常规断开走 `close`/`error` 事件，不受影响；在意槽位回收速度的运维
+   * 可以把 `DRC_PING_INTERVAL_MS` 调小（15 s 时回收最坏 31 s，突发仍是全表的 1/60）。
+   * 保活只走 WS 层 ping：主机与小程序都不发应用层 ping，改判应用层心跳会
+   * 周期性踢掉空闲客户端（取证 relay-and-wireformat.md §5.4）。
+   */
+  function sweepPingBucket(): void {
+    currentPingBucket = (currentPingBucket + 1) % pingBucketCount
+    for (const peer of bucketAt(currentPingBucket)) {
+      if (!peer.alive) {
+        log.warn('heartbeat timeout', { clientId: peer.clientId, hostId: peer.hostId })
+        peer.ws.terminate()
+        continue
+      }
+      peer.alive = false
+      try {
+        peer.ws.ping()
+      } catch {
+        /* 已关闭 */
+      }
+    }
+    // `lastPingAgo` 的契约含义不变（"保活机制上次运转是几秒前"），但它的**上界**
+    // 从 sweepMs 变成 pingTickMs：现在每秒都在轮一个桶，所以正常值恒为 0~1。
+    // 告警规则若写的是 `lastPingAgo > 30`（=保活停了），照旧成立。
+    lastPingAt = Date.now()
   }
 
   function peersOfSockets(): Array<[WebSocket, Peer]> {
@@ -656,6 +723,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   async function close(): Promise<void> {
     if (sweepTimer) clearInterval(sweepTimer)
+    if (pingTimer) clearInterval(pingTimer)
     shuttingDown = true
     wss.clients.forEach((ws) => ws.close(1001, 'server_shutdown'))
     await new Promise<void>((resolve) => http.close(() => resolve()))
@@ -664,6 +732,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
   function startListening(): Promise<{ port: number; bind: string }> {
     sweepTimer = setInterval(sweep, config.sweepMs)
     sweepTimer.unref()
+    pingTimer = setInterval(sweepPingBucket, config.pingTickMs)
+    pingTimer.unref()
     return new Promise((resolve, reject) => {
       http.once('error', reject)
       http.listen(config.port, config.bind, () => {
