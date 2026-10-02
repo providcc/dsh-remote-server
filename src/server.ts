@@ -591,9 +591,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
     // 慢消费者判定：**定时驱动**，不看这一轮有没有入站帧（见 noteBackpressure 的注释）。
     // 只对 OPEN 的连接读 bufferedAmount——已关闭的连接读它是无意义的。
     const backpressureAt = Date.now()
-    for (const [ws, peer] of peersOfSockets()) {
+    forEachPeer((ws, peer) => {
       if (ws.readyState === WS_OPEN) noteBackpressure(peer, backpressureAt)
-    }
+    })
     // D6：超过宽限期仍没回来的主机，才真正通知它的客户端重配对。
     for (const dropped of state.expireOfflineHosts(config.hostGraceMs)) {
       // 这里曾经误写成**嵌套两层同一个 clientIds**（外层内层同名），于是每个客户端收到
@@ -645,13 +645,22 @@ export function createRelay(config: RelayConfig): RelayHandle {
     lastPingAt = Date.now()
   }
 
-  function peersOfSockets(): Array<[WebSocket, Peer]> {
-    const out: Array<[WebSocket, Peer]> = []
+  /**
+   * 遍历当前所有对端。**刻意不复制数组**（C2）：旧写法每轮先摊出一个长度 N 的
+   * `[ws, peer]` 数组，10k 连接下就是每轮 10k 个数组槽 + 10k 个元组，全是纯垃圾。
+   *
+   * 别把它当成"漏了防护"又加回复制——遍历中确实会发生删除，而这里是安全的：
+   * - `Set.prototype.forEach` 对"迭代期间删除当前元素"有明确定义的行为（不会漏、不会重）；
+   * - 真正的删除发生在 `close` 事件里（`peers.delete` / 桶 `delete`），而 `terminate()`
+   *   / `close()` 的事件抛出是**异步**的，不在本次同步遍历窗口内；
+   * - 遍历期间新建的连接这一轮访问不到——**这正是我们要的**：它还没走完 `hello`，
+   *   拿它判慢消费者是错的。
+   */
+  function forEachPeer(visit: (ws: WebSocket, peer: Peer) => void): void {
     wss.clients.forEach((ws) => {
       const peer = peers.get(ws)
-      if (peer) out.push([ws, peer])
+      if (peer) visit(ws, peer)
     })
-    return out
   }
 
   // ── HTTP ────────────────────────────────────────────────────────────
