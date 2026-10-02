@@ -25,19 +25,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
-      # 本仓暂不带 lockfile：`dsh-remote-wire` 还没发布到 npm 时，`^1.0.0` 解析不出来。
-      # 引导顺序：① 先发协议包（打 `v*` 标签走它的 Release）→ ② 在本仓跑一次 `pnpm install`
-      # 并把生成的 pnpm-lock.yaml 提交 → ③ 把这里改成 `--frozen-lockfile`（这一步别忘）。
+      # lockfile 已提交（协议包 `dsh-remote-wire@1.0.0` 上了 npm 之后生成的），所以冻结安装。
+      # 协议升版后要重新 `pnpm install` 并提交新的 pnpm-lock.yaml，否则这里会红。
       - name: Install
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Type-check
         run: pnpm typecheck
@@ -58,17 +55,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: pnpm
 
-      # 同上：协议包发布前无法冻结锁文件。
+      # 同 test job：lockfile 已提交，冻结安装。
       - name: Install
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build the single-file artifact
         run: pnpm build
