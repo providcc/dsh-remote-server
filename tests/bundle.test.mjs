@@ -11,7 +11,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -108,29 +108,30 @@ test('协议包声明 sideEffects:false —— 上面那条零知识保证的前
 })
 
 /**
- * 发布形状：`npm i -g dsh-remote-server` 之后 `drc-relay` 必须真的能跑起来。
- * 这几条判的都是"装上了但用不了"，而且不需要联网装。
+ * 分发决策的闸门：**本仓不发 npm**。原因很硬——`dsh-remote-server` 这个包名在 npm 上属于
+ * 另一个无关项目（`bondzhu` / `MRZHUH/dsh-remote-server`，一个"在 DSH 会话里 @ 服务器走 SSH
+ * 执行命令"的工具），2026-10-03 用户拍板"先不发"。
+ * 这里钉的是**别半发**：半发的形状是 package.json 去掉了 private、release.yml 里多了一步
+ * publish，而包名撞墙——结局要么红在 CI，要么更糟：装到别人的东西。
+ * 末尾两条与发不发无关，是产物事实：运行时依赖为空、shebang 在第一行。
  */
-test('npm 发布形状：bin 可执行、files 每一项都在磁盘上、运行时依赖为空', () => {
+test('本仓不发 npm：private 必须为 true，release.yml 里不许出现发包步骤与 id-token', () => {
   const root = path.join(path.dirname(new URL(import.meta.url).pathname), '..')
   const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
-  assert.equal(pkg.private, undefined, 'private 还写着 true：publish 会整包跳过，工作流绿了也没发包')
-  const binFile = Object.values(pkg.bin ?? {})[0]
-  assert.ok(binFile, '没有 bin 就不是一个可执行包')
-  assert.equal(pkg.main, binFile, 'main 与 bin 必须指向同一个自包含产物：两份入口迟早分叉')
-  const shipped = binFile.replace(/^\.\//, '')
-  assert.ok((pkg.files ?? []).includes(shipped), `bin 指的 ${binFile} 不在 files 白名单里，装出来是个空壳`)
-  for (const entry of pkg.files ?? []) {
-    assert.ok(existsSync(path.join(root, entry)), `files 里的 ${entry} 在磁盘上不存在——npm 不报错，只是静默不打包它`)
-  }
+  assert.equal(pkg.private, true, 'private 被去掉了：那意味着有人准备发包，但这个名字是别人的')
+  assert.equal(pkg.bin, undefined, 'bin 是发包才需要的东西，留着它会让人以为 npm 上装得到')
+  assert.equal(pkg.files, undefined, 'files 白名单同理：它只会诱导别人去 npm pack 一个私有包')
+  const workflow = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8')
+  assert.doesNotMatch(workflow, /(npm|pnpm)\s+(publish|pack)\b/, 'release.yml 里出现了发包步骤，而本仓不发 npm')
+  assert.doesNotMatch(workflow, /id-token: write/, 'id-token 只为 OIDC provenance 存在；不发 npm 就不该申请这个权限')
   assert.deepEqual(
     pkg.dependencies,
     {},
-    '产物已内联 ws/zod/dsh-remote-wire，运行时依赖必须是空：列了就是让每个消费者白拉一棵树',
+    '产物已内联 ws/zod/dsh-remote-wire，运行时依赖必须是空：列了就是让源码消费者白拉一棵树',
   )
   assert.equal(
     readFileSync(BUNDLE, 'utf8').split('\n', 1)[0],
     '#!/usr/bin/env node',
-    'shebang 必须是产物第一行，否则 drc-relay 找不到 node',
+    'shebang 必须在第一行，否则 chmod +x 之后 ./relay.mjs 起不来',
   )
 })

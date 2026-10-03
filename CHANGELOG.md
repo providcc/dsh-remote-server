@@ -7,33 +7,32 @@
 
 ## [未发布]
 
-### 新增
-
-- **发成 npm 包 `dsh-remote-server`，带一个可执行命令 `drc-relay`**。此前它只以"GitHub Release
-  上挂的一个 `.mjs`"分发；现在 `npm i -g dsh-remote-server` 也能拿到**同一个文件**：
-  `bin` 与 `main` 都指向 `dist/bundle/main.js`，产物第一行加了 `#!/usr/bin/env node`
-  （只服务 `bin` 这条路；scp 那条仍是 `node relay.mjs`）。发布走与插件仓同一条
-  **OIDC / Trusted Publishing**（`id-token: write`、**不设 `NPM_TOKEN`**），
-  并且发完独立回查注册表的 attestation——工作流绿不等于带 provenance（wire 那次就是
-  绿着没带上）。
-- `files` 白名单：`dist/bundle/main.js` + `deploy/` + `docs/SELF-HOSTING.md` + 三个文档/许可。
-  这条白名单本身有闸门盯着：**每一项都必须在磁盘上存在**——写错路径时 npm 不报错，
-  只是静默不打包（本轮就把 `SELF-HOSTING.md` 写在了根目录，实际在 `docs/` 下）。
-- `prepack` 先构建再打包，所以 `npm pack` / `publish` 不可能发出一份过期的 `dist/`。
-
 ### 变更
 
 - **`dependencies` 清空**（`ws` 移到 `devDependencies`）。产物早就把 `ws`、`zod`、
   `dsh-remote-wire` 全部内联了（`bundle-relay` 的日志会列出内联了哪几个包），列在运行时依赖里
-  等于让每个消费者白拉一棵树；`bufferutil` / `utf-8-validate` 仍是 external，缺了照常跑。
-- 去掉 `"private": true`。留着它的话 `pnpm publish` 会**静默跳过**这个包——工作流照样绿。
+  等于让每个源码消费者白拉一棵树；`bufferutil` / `utf-8-validate` 仍是 external，缺了照常跑。
+- **产物第一行加 `#!/usr/bin/env node`**：于是 `install -m 755 relay.mjs && ./relay.mjs`
+  这条部署写法成立（`node relay.mjs` 照旧可用）。
 
-下一版按语义化版本记 **1.1.0**（新增分发面，无破坏性变更）；发布时按 `chore(release): 1.1.0`
-抬版本、推 `v1.1.0` 标签。前置条件是 npm 侧那条 Trusted Publishing：
+### 试过又撤回的一条：发成 npm 包
 
-```sh
-npm trust github dsh-remote-server --repo providcc/dsh-remote-server --file release.yml --allow-publish
-```
+2026-10-03 做过 `bin: drc-relay` + `files` 白名单 + `prepack` + OIDC 发布两步（提交
+`78622e2`；本机 `npm pack` → 空目录 `npm install <tgz>` → `./node_modules/.bin/drc-relay`
+起得来、`/healthz` 应答过），随后**撤回**：`dsh-remote-server` 这个包名在 npm 上属于另一个
+无关项目（`bondzhu` / `MRZHUH/dsh-remote-server`，最新 0.1.1，2026-08-17 发，一个"在 DSH
+会话里 @ 服务器、走 SSH 执行命令、两级审批"的工具），我们发不出去；用户拍板**先不发**。
+撤回之后留下的东西不是零：
+
+- 上面那两条真实修正（运行时依赖为空、shebang）。
+- 一条闸门测试（`tests/bundle.test.mjs`）：`private` 必须为 true、`bin` / `files` 不许回来、
+  `release.yml` 里不许出现 `npm|pnpm publish|pack` 与 `id-token: write`。它防的是**半发**——
+  去掉 private 却发不出去，或者更糟：文档里写着 `npm i -g dsh-remote-server` 而别人装到的是
+  那个同名工具。**这条不是"怕以后用到"，是这次真的踩到了名字冲突。**
+- README 与 `docs/SELF-HOSTING.md` 顶部各写了一句"本仓不发 npm，别照抄那条安装命令"。
+
+以后要重新起意发包，先解决名字：2026-10-03 实测 `dsh-remote-relay`、`drc-relay`、
+`dsh-rc-relay` 都空着（`dsh-relay` 已被占），改动要同步 `release.yml`、上面那条闸门与两份文档。
 
 ### 删除（零调用的面与在防自家 schema 的那一道）
 

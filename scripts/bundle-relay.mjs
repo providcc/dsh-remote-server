@@ -47,8 +47,8 @@ const result = await esbuild.build({
   external: ['bufferutil', 'utf-8-validate'],
   define: { __DRC_VERSION__: JSON.stringify(String(PKG.version)) },
   banner: {
-    // shebang 必须是产物第一行：`npm i -g` 之后 `drc-relay` 就是靠它找到 node 的。
-    // 第二行是 ESM 里的 require 垫片（esbuild 的 createRequire 注入约定）。
+    // shebang 让产物可以 `chmod +x relay.mjs && ./relay.mjs`（`install -m 755` 那条路），
+    // 所以必须在第一行。第二行是 ESM 里的 require 垫片（esbuild 的 createRequire 注入约定）。
     js: "#!/usr/bin/env node\nimport { createRequire as __drcCreateRequire } from 'node:module';const require = __drcCreateRequire(import.meta.url);",
   },
   logLevel: 'warning',
