@@ -11,7 +11,6 @@
  */
 import { readFileSync } from 'node:fs'
 import { loadConfig, type ConfigProblem } from './config.js'
-import { Log } from './log.js'
 import { createRelay } from './server.js'
 
 /** 打包时由 `scripts/bundle-relay.mjs` 以 esbuild define 注入；未打包时这个标识符不存在。 */
@@ -22,14 +21,12 @@ function readVersion(): string {
   // 文件旁边没有 package.json，两条相对路径探针都会落空，`/healthz` 的 version
   // 会变成 `0.0.0`——而运维正是靠这个字段判断线上跑的是哪一版。
   if (typeof __DRC_VERSION__ === 'string' && __DRC_VERSION__) return __DRC_VERSION__
-  // 开发态（tsc 产物 dist/src/）往上两层才是包目录，还能按文件读。
-  for (const candidate of ['../../package.json', '../package.json']) {
-    try {
-      const pkg = JSON.parse(readFileSync(new URL(candidate, import.meta.url), 'utf8')) as { version?: string }
-      if (typeof pkg.version === 'string') return pkg.version
-    } catch {
-      /* 试下一个位置 */
-    }
+  // 开发态（tsc 产物在 dist/src/）往上两层才是包目录，还能按文件读。
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version?: string }
+    if (typeof pkg.version === 'string') return pkg.version
+  } catch {
+    /* 读不到就落回 0.0.0 */
   }
   return '0.0.0'
 }

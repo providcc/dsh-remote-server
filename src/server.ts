@@ -32,7 +32,6 @@ import {
   pairReady as pairReadyFrameOf,
   paired as pairedFrameOf,
   peerJoinedForHost,
-  peerJoinedNotice,
   peerLeft as peerLeftFrame,
   pong as pongFrameOf,
 } from 'dsh-remote-wire/outbound'
@@ -41,7 +40,6 @@ import { BackpressureGate, Budget, FrameRateGate } from './limits.js'
 import { Log, REDACTED } from './log.js'
 import { RelayState, WS_OPEN, type Sock } from './state.js'
 
-const SHUTDOWN_FORCE_MS = 5000
 /** 保留的自定义关闭码：同 hostId 顶号。客户端的重连策略不认识它，只对主机有意义。 */
 const CLOSE_REPLACED = 4000
 
@@ -236,7 +234,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // 客户端自带 clientId 时**原样保留**：小程序冷启动后仍会用存储里那个 installId，
       // 若这里另发一个，D3 的重挂与 D4 的成员校验会在下次冷启动时永远对不上。
       const clientId = frame.clientId?.trim() || randomUUID()
-      const { replaced } = state.attachClient(clientId, peer.ws, frame.clientMeta)
+      const { replaced } = state.attachClient(clientId, peer.ws)
       peer.role = 'client'
       peer.clientId = clientId
       if (replaced) {
@@ -249,8 +247,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
       log.info('client online', { clientId, platform: frame.clientMeta?.platform })
       return
     }
-
-    sendError(peer, 'bad_role')
+    // 走到这里是不可能的：`helloFrame` 的 role 是 z.enum(['host','client'])，
+    // 两个分支都 return 了。以前这里补一条 `sendError(peer, 'bad_role')`，
+    // 那是在防自家 schema，不是在防对端。
   }
 
   function handlePairBegin(peer: Peer, frame: Extract<EndpointFrame, { t: 'pair-begin' }>): void {
@@ -757,7 +756,3 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   return { http, wss, state, log, health, close, startListening }
 }
-
-/** 供测试与 main 共用：把 ws 的 OPEN 常量与 Sock 形状暴露出去。 */
-export { WS_OPEN, type Sock }
-export const WEBSOCKET_OPEN = WebSocket.OPEN

@@ -20,7 +20,6 @@
  * 所以状态机可以被纯内存的单测完整驱动，不需要真的起 socket。
  */
 import { newConversationId } from 'dsh-remote-wire/ids'
-import type { ClientMeta } from 'dsh-remote-wire/frames'
 
 /** 对端 socket 的最小面（真实现是 `ws` 的 WebSocket，测试里可以是内存对象）。 */
 export interface Sock {
@@ -39,7 +38,6 @@ export interface HostEntry {
 
 export interface ClientEntry {
   ws: Sock
-  meta?: ClientMeta
 }
 
 /** 待配对条目。**没有 psk 字段**——中继从不知道密钥（D1）。 */
@@ -63,7 +61,7 @@ export interface Conversation {
 export type ClaimResult =
   { ok: true; conversationId: string; hostId: string; detached: string[] } | { ok: false; reason: PairRejectReason }
 
-export type PairRejectReason = 'invalid_or_expired' | 'already_used' | 'host_offline' | 'rate_limited'
+export type PairRejectReason = 'invalid_or_expired' | 'already_used' | 'host_offline'
 
 export interface Clock {
   now(): number
@@ -110,9 +108,9 @@ export class RelayState implements Clock {
    * 用的还是存储里那个 installId，若这里另发一个，D3 的重挂与 D4 的成员校验
    * 会在下一次冷启动时永远对不上。
    */
-  attachClient(clientId: string, ws: Sock, meta?: ClientMeta): { replaced?: Sock } {
+  attachClient(clientId: string, ws: Sock): { replaced?: Sock } {
     const previous = this.clients.get(clientId)
-    this.clients.set(clientId, { ws, ...(meta ? { meta } : {}) })
+    this.clients.set(clientId, { ws })
     // 复核 R3：clientId 虽然不是凭据，但**同 id 必须有唯一活动连接**。
     // 旧写法直接覆盖，结果抢注方拿到路由、真手机的 socket 还"开着"（因此不会重连），
     // 表现是手机侧永久静默。顶号让双方都能立刻看到断开，各自按策略重来。
@@ -122,10 +120,6 @@ export class RelayState implements Clock {
   /** 该 socket 当前是否仍是某个身份的活连接（close 回调的竞态守卫）。 */
   isLiveHost(hostId: string, ws: Sock): boolean {
     return this.hosts.get(hostId)?.ws === ws
-  }
-
-  isLiveClient(clientId: string, ws: Sock): boolean {
-    return this.clients.get(clientId)?.ws === ws
   }
 
   // ── 配对 ────────────────────────────────────────────────────────────

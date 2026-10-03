@@ -5,6 +5,35 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [未发布]
+
+### 删除（零调用的面与在防自家 schema 的那一道）
+
+按"没用的就删，用到再重写"过了一遍，逐个 grep 过 `src` / `tests` / 伞仓 `e2e` 与文档之后：
+
+- `limits.ts`：`Budget.peek()`（注释写着"只为诊断与测试可读"，两边都没读）与
+  `Violations.exhausted`（日志里那句 "pair budget exhausted" 是**字符串**，不是这个 getter）。
+- `log.ts`：内存里的 `tail` / `tailSize` / `drain()` / `static collectLines()`。日志的取证面一直是
+  stdout（测试抓的是被 spawn 的子进程的输出），这份 200 行的副本没有任何读者。
+- `state.ts`：`isLiveClient()`（`clientGone` 自己内联比较）、`ClientEntry.meta` 与
+  `attachClient` 的第三个参数——`clientMeta` 在 `client online` 那条日志里就用掉了，存进状态簿
+  之后**只有测试读它**，那是写一份没人读的内存状态；连带 `PairRejectReason` 去掉
+  `'rate_limited'`（`claim()` 的三个返回点里没有它，线上枚举也不认）。
+- `server.ts`：`peerJoinedNotice` 的未用导入、`export { WS_OPEN, type Sock }` 与
+  `WEBSOCKET_OPEN`（测试从 `state.js` 拿 `WS_OPEN`）、从没接线过的 `SHUTDOWN_FORCE_MS`，
+  以及 hello 分支末尾那条 `sendError(peer, 'bad_role')` —— `helloFrame` 的 role 是
+  `z.enum(['host','client'])` 且两支都 return，那一行是在防自家 schema 而不是防对端。
+- `main.ts`：版本探针的第二个候选路径 `../package.json`（tsc 产物在 `dist/src/`、单文件产物走
+  编译期注入的那个值，两个真实形态都不需要它）。
+- `package.json`：`start:bundle` 与 `start:tsc`（与 `start` 重复 / 没人引用；文档一律直接
+  `node dist/bundle/main.js` 或 `scripts/relay-start.sh`）。
+
+**留着没删的三处**，因为它们不是"怕万一"而是有来由的：`bucketAt()` 索引越界就抛（注释写明
+"退回临时 Set 等于悄悄丢桶"）、`noteBackpressure` 的 `bufferedAmount ?? 0`（假 socket 没有这个
+字段，缺了它会把 `undefined` 喂进限速判断）、以及入站帧的全部边界校验。
+
+78 项（1 skip）全绿，`tsc --noUnusedLocals --noUnusedParameters` 干净。
+
 ## [1.0.1] - 2026-10-03
 
 ### 新增

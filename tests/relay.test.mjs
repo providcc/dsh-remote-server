@@ -178,7 +178,6 @@ test('注册：客户端 hello 得到 hello-ok，且 relay 原样保留它带来
     })
     const ok = await client.until((f) => f.t === 'hello-ok')
     assert.deepEqual({ role: ok.role, clientId: ok.clientId }, { role: 'client', clientId: 'mdwx-abc' })
-    assert.equal(ctx.relay.state.clients.get('mdwx-abc').meta.platform, 'wechat-mp')
   } finally {
     await ctx.close()
   }

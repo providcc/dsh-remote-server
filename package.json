@@ -31,8 +31,6 @@
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs",
     "start": "node dist/bundle/main.js",
-    "start:bundle": "node dist/bundle/main.js",
-    "start:tsc": "node dist/src/main.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs && node --test \"tests/*.test.mjs\"",
     "format": "prettier --write .",

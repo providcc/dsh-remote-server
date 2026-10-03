@@ -34,13 +34,10 @@ export const REDACTED = '<redacted>'
 
 export class Log {
   private readonly threshold: number
-  /** 最近若干行，供测试与 `/healthz` 之外的诊断读取（只在内存里，默认留 200 行）。 */
-  private readonly tail: LogRecord[] = []
 
   constructor(
-    private readonly level: LogLevel,
+    level: LogLevel,
     private readonly write: (line: string) => void = (line) => process.stdout.write(line + '\n'),
-    private readonly tailSize = 200,
   ) {
     this.threshold = levelWeight(level)
   }
@@ -52,8 +49,6 @@ export class Log {
       if (value === undefined) continue
       record[key] = value
     }
-    this.tail.push(record)
-    if (this.tail.length > this.tailSize) this.tail.shift()
     this.write(JSON.stringify(record))
   }
 
@@ -71,15 +66,5 @@ export class Log {
 
   error(msg: string, fields?: LogFields): void {
     this.log('error', msg, fields)
-  }
-
-  /** 已写出的行（含被级别过滤掉的？不含——过滤掉的根本没构造）。测试用 `drain()` 取。 */
-  drain(): LogRecord[] {
-    return [...this.tail]
-  }
-
-  /** 已写出的原始行文本，用于"日志里不许出现业务明文"的断言。 */
-  static collectLines(sink: string[]): (line: string) => void {
-    return (line) => sink.push(line)
   }
 }
