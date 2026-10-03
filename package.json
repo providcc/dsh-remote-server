@@ -2,7 +2,6 @@
   "name": "dsh-remote-server",
   "version": "1.0.1",
   "description": "Zero-knowledge WebSocket relay for DSH Remote Control. Routes sealed records between the host plugin and paired clients; never sees plaintext.",
-  "private": true,
   "type": "module",
   "license": "MIT",
   "author": "providcc",
@@ -26,26 +25,37 @@
   "engines": {
     "node": ">=20"
   },
-  "main": "./dist/src/main.js",
+  "bin": {
+    "drc-relay": "./dist/bundle/main.js"
+  },
+  "main": "./dist/bundle/main.js",
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs",
     "start": "node dist/bundle/main.js",
+    "prepack": "pnpm build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs && node --test \"tests/*.test.mjs\"",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
+  "files": [
+    "dist/bundle/main.js",
+    "deploy",
+    "README.md",
+    "docs/SELF-HOSTING.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.9.0",
     "@types/ws": "^8.5.12",
     "dsh-remote-wire": "^1.0.0",
     "esbuild": "^0.27.7",
     "prettier": "^3.3.3",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "ws": "^8.18.0"
   },
   "packageManager": "pnpm@11.7.0"
 }

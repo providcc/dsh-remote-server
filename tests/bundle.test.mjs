@@ -11,7 +11,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { copyFileSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -105,4 +105,32 @@ test('协议包声明 sideEffects:false —— 上面那条零知识保证的前
   const pkg = JSON.parse(readFileSync(require.resolve('dsh-remote-wire/package.json'), 'utf8'))
   assert.equal(pkg.sideEffects, false, '没有这条，打包器不会把 record/keys 从产物里摇掉')
   assert.ok(!('tweetnacl' in (pkg.dependencies ?? {})) === false, 'tweetnacl 仍是协议包的运行时依赖（插件要用）')
+})
+
+/**
+ * 发布形状：`npm i -g dsh-remote-server` 之后 `drc-relay` 必须真的能跑起来。
+ * 这几条判的都是"装上了但用不了"，而且不需要联网装。
+ */
+test('npm 发布形状：bin 可执行、files 每一项都在磁盘上、运行时依赖为空', () => {
+  const root = path.join(path.dirname(new URL(import.meta.url).pathname), '..')
+  const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
+  assert.equal(pkg.private, undefined, 'private 还写着 true：publish 会整包跳过，工作流绿了也没发包')
+  const binFile = Object.values(pkg.bin ?? {})[0]
+  assert.ok(binFile, '没有 bin 就不是一个可执行包')
+  assert.equal(pkg.main, binFile, 'main 与 bin 必须指向同一个自包含产物：两份入口迟早分叉')
+  const shipped = binFile.replace(/^\.\//, '')
+  assert.ok((pkg.files ?? []).includes(shipped), `bin 指的 ${binFile} 不在 files 白名单里，装出来是个空壳`)
+  for (const entry of pkg.files ?? []) {
+    assert.ok(existsSync(path.join(root, entry)), `files 里的 ${entry} 在磁盘上不存在——npm 不报错，只是静默不打包它`)
+  }
+  assert.deepEqual(
+    pkg.dependencies,
+    {},
+    '产物已内联 ws/zod/dsh-remote-wire，运行时依赖必须是空：列了就是让每个消费者白拉一棵树',
+  )
+  assert.equal(
+    readFileSync(BUNDLE, 'utf8').split('\n', 1)[0],
+    '#!/usr/bin/env node',
+    'shebang 必须是产物第一行，否则 drc-relay 找不到 node',
+  )
 })

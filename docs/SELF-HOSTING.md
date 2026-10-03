@@ -20,6 +20,17 @@ pnpm build
 # → dist/bundle/main.js
 ```
 
+也可以不构建，直接装发布件——**同一个文件**，只是多了一行 `#!/usr/bin/env node` 与一个 `bin`：
+
+```sh
+npm install -g dsh-remote-server
+DRC_HOST_TOKEN=$(openssl rand -hex 32) DRC_PORT=8787 drc-relay
+```
+
+`drc-relay` 指向的就是 `dist/bundle/main.js`（`package.json` 的 `bin` 与 `main` 同指一处，
+不存在第二份实现）。shebang 只服务 `bin` 这一条路；下面 scp 那条是 `node relay.mjs`，
+有没有这行都一样。
+
 这条 `build` 做两件事（`package.json`）：`tsc -p tsconfig.json`（类型检查 + `dist/src/**`）
 与 `node scripts/bundle-relay.mjs`（esbuild 打成单文件）。
 

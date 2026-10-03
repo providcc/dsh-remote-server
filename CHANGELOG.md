@@ -7,6 +7,34 @@
 
 ## [未发布]
 
+### 新增
+
+- **发成 npm 包 `dsh-remote-server`，带一个可执行命令 `drc-relay`**。此前它只以"GitHub Release
+  上挂的一个 `.mjs`"分发；现在 `npm i -g dsh-remote-server` 也能拿到**同一个文件**：
+  `bin` 与 `main` 都指向 `dist/bundle/main.js`，产物第一行加了 `#!/usr/bin/env node`
+  （只服务 `bin` 这条路；scp 那条仍是 `node relay.mjs`）。发布走与插件仓同一条
+  **OIDC / Trusted Publishing**（`id-token: write`、**不设 `NPM_TOKEN`**），
+  并且发完独立回查注册表的 attestation——工作流绿不等于带 provenance（wire 那次就是
+  绿着没带上）。
+- `files` 白名单：`dist/bundle/main.js` + `deploy/` + `docs/SELF-HOSTING.md` + 三个文档/许可。
+  这条白名单本身有闸门盯着：**每一项都必须在磁盘上存在**——写错路径时 npm 不报错，
+  只是静默不打包（本轮就把 `SELF-HOSTING.md` 写在了根目录，实际在 `docs/` 下）。
+- `prepack` 先构建再打包，所以 `npm pack` / `publish` 不可能发出一份过期的 `dist/`。
+
+### 变更
+
+- **`dependencies` 清空**（`ws` 移到 `devDependencies`）。产物早就把 `ws`、`zod`、
+  `dsh-remote-wire` 全部内联了（`bundle-relay` 的日志会列出内联了哪几个包），列在运行时依赖里
+  等于让每个消费者白拉一棵树；`bufferutil` / `utf-8-validate` 仍是 external，缺了照常跑。
+- 去掉 `"private": true`。留着它的话 `pnpm publish` 会**静默跳过**这个包——工作流照样绿。
+
+下一版按语义化版本记 **1.1.0**（新增分发面，无破坏性变更）；发布时按 `chore(release): 1.1.0`
+抬版本、推 `v1.1.0` 标签。前置条件是 npm 侧那条 Trusted Publishing：
+
+```sh
+npm trust github dsh-remote-server --repo providcc/dsh-remote-server --file release.yml --allow-publish
+```
+
 ### 删除（零调用的面与在防自家 schema 的那一道）
 
 按"没用的就删，用到再重写"过了一遍，逐个 grep 过 `src` / `tests` / 伞仓 `e2e` 与文档之后：
