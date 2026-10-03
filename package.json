@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zero-knowledge WebSocket relay for DSH Remote Control. Routes sealed records between the host plugin and paired clients; never sees plaintext.",
   "private": true,
   "type": "module",

@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
-## [未发布]
+## [1.0.1] - 2026-10-03
 
 ### 新增
 
@@ -45,4 +45,5 @@
 - 结构性零知识的机械防线：产物级断言构建产物里不含密码学代码。
 
 [未发布]: https://github.com/providcc/dsh-remote-server/compare/v1.0.0...HEAD
+[1.0.1]: https://github.com/providcc/dsh-remote-server/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/providcc/dsh-remote-server/releases/tag/v1.0.0
