@@ -91,6 +91,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
   let sweepTimer: NodeJS.Timeout | undefined
   let pingTimer: NodeJS.Timeout | undefined
   let lastPingAt = 0
+  /** 上一次把计数器抄进日志的时刻（0 = 还没抄过，所以启动后第一轮就抄）。 */
+  let lastCountersAt = 0
 
   /**
    * ping 分桶轮转（C1）。桶数 = 心跳周期 / tick，每 tick 只 ping 一个桶。
@@ -606,6 +608,27 @@ export function createRelay(config: RelayConfig): RelayHandle {
     for (const conversationId of state.sweepIdle(config.conversationIdleTtlMs)) {
       log.info('conversation idle-dropped', { sessionId: conversationId })
     }
+    // 计数器快照借这一轮的节拍，但它**不是**表项生命周期的一部分（见 logCountersIfDue 的注释）。
+    logCountersIfDue()
+  }
+
+  /**
+   * 按 `countersLogMs`（默认 60 s）把 `/healthz` 那组数原样抄进日志。
+   *
+   * 为什么要有这一条：`droppedFrames` / `slowConsumers` / `rejectedPairs` 是**自启动累计**，
+   * 只在当前进程的 `/healthz` 里有值，进程一换就归零；而中继本来不为每一次丢帧写日志
+   * （四处计数点里有两处注释就写着"它在日志里不留痕，只能靠这个计数被发现"）。
+   * 两件事加起来，"昨天那一段时间丢了多少帧"以前**根本问不出来**（伞仓 HANDOFF §3.3）。
+   * 抄进日志之后它进 journalctl，成了可查的历史。
+   *
+   * 字段直接复用 `health()`，不在这里第二处列一遍——两处各写迟早分叉，
+   * 而分叉之后"日志说的"和"`/healthz` 说的"就成了一套罗夏测试。
+   */
+  function logCountersIfDue(): void {
+    const now = Date.now()
+    if (now - lastCountersAt < config.countersLogMs) return
+    lastCountersAt = now
+    log.info('counters', health())
   }
 
   /**
