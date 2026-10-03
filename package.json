@@ -52,7 +52,7 @@
     "@types/node": "^22.9.0",
     "@types/ws": "^8.5.12",
     "dsh-remote-wire": "^1.0.0",
-    "esbuild": "^0.27.7",
+    "esbuild": "^0.28.2",
     "prettier": "^3.3.3",
     "typescript": "^5.6.3",
     "ws": "^8.18.0"
