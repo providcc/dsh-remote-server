@@ -73,7 +73,7 @@ scp deploy/systemd/dsh-remote-control.service root@HOST:/etc/systemd/system/
 | `DRC_PUBLIC_URL`             |      | **空字符串**        | URL    | `/api/info` 返回的对外地址。公网填 `wss://你的域名`                                                                                                          |
 | `DRC_PAIR_TTL_MS`            |      | `120000`            | 毫秒   | 配对码的**服务端权威**寿命。生产实例实际用 `90000`；建议公网收紧到 60s。主机必须按 `pair-ready.ttlMs` 改写本地过期时间                                       |
 | `DRC_LOG_LEVEL`              |      | `info`              | 枚举   | `debug` / `info` / `warn` / `error` / `silent`。**区分大小写**，写 `INFO` 会拒绝启动                                                                         |
-| `DRC_MAX_MSG_BYTES`          |      | `262144`（256 KiB） | 字节   | 单帧上限（喂给 `ws` 的 `maxPayload`），超过直接 1009 断开。**不要往小调**：低于 256 KiB 会把大的流式 delta 硬切断，表现是"输出说到一半就重连"                |
+| `DRC_MAX_MSG_BYTES`          |      | `1048576`（1 MiB）  | 字节   | 单帧上限（喂给 `ws` 的 `maxPayload`），超过直接 1009 断开。**不要往小调**：低于 256 KiB 会把大的流式 delta 硬切断，表现是"输出说到一半就重连"（图片附件上线时从 256 KiB 提到 1 MiB） |
 | `DRC_MAX_CONNS`              |      | `200`               | 连接数 | 并发连接上限，超出的新连接立刻 1013 `server_busy`                                                                                                            |
 | `DRC_MAX_FRAMES_PER_SEC`     |      | `500`               | 帧/秒  | 单连接帧速率（固定窗口，每秒重置）。超限时窗口内回一次 `error{rate_limited}`，**累计 3 次违规** → 1008 断开                                                  |
 | `DRC_HOST_AUTH_MAX_ATTEMPTS` |      | `5`                 | 次     | 单连接允许的 host 认证失败次数，用尽 → 4001 `too_many_auth_attempts`                                                                                         |
@@ -81,8 +81,9 @@ scp deploy/systemd/dsh-remote-control.service root@HOST:/etc/systemd/system/
 | `DRC_PAIR_GLOBAL_PER_SEC`    |      | `20`                | 次/秒  | 全局配对尝试配额。6 位码只有 10⁶ 空间，这一条是唯一的暴力枚举防线                                                                                            |
 | `DRC_MAX_PENDING_PAIRS`      |      | `1000`              | 条     | 待配对表上限，防无界增长；装满后新码得到 `error{pair_table_full}`（已存在的 token 允许覆盖）                                                                 |
 | `DRC_CONV_IDLE_TTL_MS`       |      | `604800000`（7 天） | 毫秒   | 会话空闲多久后被回收。续用不是无限期                                                                                                                         |
+| `DRC_CONV_EMPTY_TTL_MS`      |      | `1800000`（30 分）  | 毫秒   | **空会话**回收：最后一个客户端离开后，一条没有任何成员的空会话挂多久被删。与上面那条是两件事——socket 断开（`clientGone`）**不会**起这个表，护的是"小程序退后台再回来不用重扫"（D3） |
 | `DRC_HOST_GRACE_MS`          |      | `120000`（120 秒）  | 毫秒   | 主机 socket 断开后多久才通知客户端"主机已离开"。没有它，一次网络抖动就会让手机丢掉配对                                                                       |
-| `DRC_SWEEP_MS`               |      | `5000`              | 毫秒   | **表清扫**周期：过期配对码清理、慢消费者判定、host 宽限期到期、会话空闲回收挂在它上面。**保活 ping 不在这里**（见下面两行）；调小只为排错（e2e 用 `1000`）   |
+| `DRC_SWEEP_MS`               |      | `5000`              | 毫秒   | **表清扫**周期：过期配对码清理、慢消费者判定、host 宽限期到期、会话空闲回收、空会话回收五件事挂在它上面。**保活 ping 不在这里**（见下面两行）；调小只为排错（e2e 用 `1000`） |
 | `DRC_COUNTERS_LOG_MS`        |      | `60000`（60 秒）    | 毫秒   | 把 `/healthz` 那组计数器按周期抄进日志（`msg:"counters"`）。`droppedFrames` 这类是**自启动累计**、进程一换就归零，不抄进日志就没法回答"昨天那段时间丢了多少" |
 | `DRC_PING_INTERVAL_MS`       | ✅   | `60000`（60 秒）    | 毫秒   | 一条连接两次被 ping 之间的目标间隔。**代价**：静默死掉（无 FIN/RST）的半开对端要约 **2 倍**这个时间才被回收，槽位回收变慢就在这里调小                        |
 | `DRC_PING_TICK_MS`           | ✅   | `1000`              | 毫秒   | ping 轮转步长，每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。桶数 = 两者的商（默认 60 桶）                                                   |
@@ -326,6 +327,7 @@ node scripts/loadtest-conns.mjs --n=10000 --seconds=30
 | `pair token issued`                                                    | info     | 主机发布了一张码，字段 `token:"<redacted>"`。**info 级不落完整配对码**。要看到真正的码得开 `debug`                                                                     |
 | `conversation voided by host` / `conversations dropped at host resync` | info     | 主机自己声明某条会话它不再持有密钥，或 `resync` 时没被列出而被删掉                                                                                                     |
 | `conversation idle-dropped`                                            | info     | 空闲超过 `DRC_CONV_IDLE_TTL_MS` 被回收。客户端下次发帧会撞上 `unknown_session`                                                                                         |
+| `conversation empty-dropped`                                           | info     | 最后一个客户端离开后空过 `DRC_CONV_EMPTY_TTL_MS` 被回收。**socket 断开不起这个表**（护 D3 免扫码），只有 `leave`/重新配对摘清成员才起                                                 |
 | `pair tokens expired`                                                  | debug    | 清扫周期清掉的过期/已用码条数                                                                                                                                          |
 
 ### 5.2 限速时"线上说法"与"日志说法"不一致（必须知道）
@@ -404,9 +406,10 @@ PSK 与配对关系落盘只会扩大泄露面。因此：
   `host online {replaced:1}`，说明有两份主机在抢同一个 `hostId`。
 - **主机重连后已有会话会挂回新 socket**：注册成功时中继会把该主机名下的会话作为
   `peer-joined` 重放给已连接的客户端，让客户端知道原来的 `convId` 还能继续用。
-- **每个清扫周期（`DRC_SWEEP_MS`）做四件事**：清过期/已用的配对码 → 给所有 socket 发 WS 层
+- **每个清扫周期（`DRC_SWEEP_MS`）做五件事**：清过期/已用的配对码 → 给所有 socket 发 WS 层
   ping 并把上一轮没回 pong 的连接 `terminate()`（默认最坏约 2×5 秒判死）→ 判 host 宽限期是否到期
-  → 回收空闲超过 `DRC_CONV_IDLE_TTL_MS` 的会话。保活**只走 WS 层 ping**。
+  → 回收空闲超过 `DRC_CONV_IDLE_TTL_MS` 的会话 → 回收**最后一个客户端离开后**空过
+  `DRC_CONV_EMPTY_TTL_MS` 的空会话（`msg:"conversation empty-dropped"`）。保活**只走 WS 层 ping**。
 - **每 `DRC_COUNTERS_LOG_MS` 抄一次计数器进日志**（`msg:"counters"`，字段与 `/healthz` 同源，
   由同一个 `health()` 产出）。为什么要有这一条：`droppedFrames` / `slowConsumers` /
   `rejectedPairs` 是**自启动累计**，`/healthz` 只在当前进程里有值，重启即归零；而中继

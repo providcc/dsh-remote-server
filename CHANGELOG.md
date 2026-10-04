@@ -5,7 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
-## [未发布]
+## [1.0.4] - 2026-10-04
+
+### 新增
+
+- **空会话回收**（`DRC_CONV_EMPTY_TTL_MS`，默认 30 分钟）。配对按 D3 长存，socket 断开
+  只是手机退后台——那时**不起表**；只有最后一个客户端主动离开（`leave`）或被重新配对
+  摘清成员（`leaveAll`）才起表，到点删会话（日志 `conversation empty-dropped`）。
+  护的是内存不无界增长，又不把"退后台再回来"的用户钉去重扫。
+
+## [1.0.3] - 2026-10-04
+
+### 变更
+
+- **单帧上限 256 KiB → 1 MiB**（`DRC_MAX_MSG_BYTES`）：`cmd.send_prompt` 开始带图片附件，
+  一张压过的 jpeg base64 后常超 256 KiB。零知识规矩不变（照样只当密文转发）。
+
+## [1.0.2] - 2026-10-03
 
 ### 新增
 
@@ -15,60 +31,6 @@
   两件事加起来，"昨天那段时间丢了多少帧"以前根本问不出来。现在它是 journalctl 里的一行，
   取差值即可。字段由**同一个 `health()`** 产出，不在日志这边再列一遍（两处各写迟早分叉）。
   这一行不许含凭据，有测试钉住（`hostToken` / `token` / `psk` / `secret` 一个都不许出现）。
-
-### 变更
-
-- **`dependencies` 清空**（`ws` 移到 `devDependencies`）。产物早就把 `ws`、`zod`、
-  `dsh-remote-wire` 全部内联了（`bundle-relay` 的日志会列出内联了哪几个包），列在运行时依赖里
-  等于让每个源码消费者白拉一棵树；`bufferutil` / `utf-8-validate` 仍是 external，缺了照常跑。
-- **产物第一行加 `#!/usr/bin/env node`**：于是 `install -m 755 relay.mjs && ./relay.mjs`
-  这条部署写法成立（`node relay.mjs` 照旧可用）。
-
-### 试过又撤回的一条：发成 npm 包
-
-2026-10-03 做过 `bin: drc-relay` + `files` 白名单 + `prepack` + OIDC 发布两步（提交
-`78622e2`；本机 `npm pack` → 空目录 `npm install <tgz>` → `./node_modules/.bin/drc-relay`
-起得来、`/healthz` 应答过），随后**撤回**：`dsh-remote-server` 这个包名在 npm 上属于另一个
-无关项目（`bondzhu` / `MRZHUH/dsh-remote-server`，最新 0.1.1，2026-08-17 发，一个"在 DSH
-会话里 @ 服务器、走 SSH 执行命令、两级审批"的工具），我们发不出去；用户拍板**先不发**。
-撤回之后留下的东西不是零：
-
-- 上面那两条真实修正（运行时依赖为空、shebang）。
-- 一条闸门测试（`tests/bundle.test.mjs`）：`private` 必须为 true、`bin` / `files` 不许回来、
-  `release.yml` 里不许出现 `npm|pnpm publish|pack` 与 `id-token: write`。它防的是**半发**——
-  去掉 private 却发不出去，或者更糟：文档里写着 `npm i -g dsh-remote-server` 而别人装到的是
-  那个同名工具。**这条不是"怕以后用到"，是这次真的踩到了名字冲突。**
-- README 与 `docs/SELF-HOSTING.md` 顶部各写了一句"本仓不发 npm，别照抄那条安装命令"。
-
-以后要重新起意发包，先解决名字：2026-10-03 实测 `dsh-remote-relay`、`drc-relay`、
-`dsh-rc-relay` 都空着（`dsh-relay` 已被占），改动要同步 `release.yml`、上面那条闸门与两份文档。
-
-### 删除（零调用的面与在防自家 schema 的那一道）
-
-按"没用的就删，用到再重写"过了一遍，逐个 grep 过 `src` / `tests` / 伞仓 `e2e` 与文档之后：
-
-- `limits.ts`：`Budget.peek()`（注释写着"只为诊断与测试可读"，两边都没读）与
-  `Violations.exhausted`（日志里那句 "pair budget exhausted" 是**字符串**，不是这个 getter）。
-- `log.ts`：内存里的 `tail` / `tailSize` / `drain()` / `static collectLines()`。日志的取证面一直是
-  stdout（测试抓的是被 spawn 的子进程的输出），这份 200 行的副本没有任何读者。
-- `state.ts`：`isLiveClient()`（`clientGone` 自己内联比较）、`ClientEntry.meta` 与
-  `attachClient` 的第三个参数——`clientMeta` 在 `client online` 那条日志里就用掉了，存进状态簿
-  之后**只有测试读它**，那是写一份没人读的内存状态；连带 `PairRejectReason` 去掉
-  `'rate_limited'`（`claim()` 的三个返回点里没有它，线上枚举也不认）。
-- `server.ts`：`peerJoinedNotice` 的未用导入、`export { WS_OPEN, type Sock }` 与
-  `WEBSOCKET_OPEN`（测试从 `state.js` 拿 `WS_OPEN`）、从没接线过的 `SHUTDOWN_FORCE_MS`，
-  以及 hello 分支末尾那条 `sendError(peer, 'bad_role')` —— `helloFrame` 的 role 是
-  `z.enum(['host','client'])` 且两支都 return，那一行是在防自家 schema 而不是防对端。
-- `main.ts`：版本探针的第二个候选路径 `../package.json`（tsc 产物在 `dist/src/`、单文件产物走
-  编译期注入的那个值，两个真实形态都不需要它）。
-- `package.json`：`start:bundle` 与 `start:tsc`（与 `start` 重复 / 没人引用；文档一律直接
-  `node dist/bundle/main.js` 或 `scripts/relay-start.sh`）。
-
-**留着没删的三处**，因为它们不是"怕万一"而是有来由的：`bucketAt()` 索引越界就抛（注释写明
-"退回临时 Set 等于悄悄丢桶"）、`noteBackpressure` 的 `bufferedAmount ?? 0`（假 socket 没有这个
-字段，缺了它会把 `undefined` 喂进限速判断）、以及入站帧的全部边界校验。
-
-78 项（1 skip）全绿，`tsc --noUnusedLocals --noUnusedParameters` 干净。
 
 ## [1.0.1] - 2026-10-03
 
