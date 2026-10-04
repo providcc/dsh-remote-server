@@ -86,12 +86,12 @@ DRC_HOST_TOKEN=smoke-token-0123456789abcdef DRC_PORT=0 node relay.mjs
 
 ## 端点
 
-| 路径                   | 说明                                                                                                                        |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| 路径                   | 说明                                                                                                                                                                                                |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /healthz`         | 运维契约：`ok` / `version` / `uptimeSec` / `hosts` / `clients` / `conversations` / `pendingPairs` / `droppedFrames` / `slowConsumers` / `rejectedPairs` / `lastPingAgo` / `shuttingDown` 十二个字段 |
-| `GET /api/info`        | `{"publicUrl","protocol"}`                                                                                                  |
-| `GET /api/pair-status` | **默认 404**。无需认证地回答"配对码 N 是否有效"，等于给 6 位码空间装了扫描 oracle；确需调试时 `DRC_PAIR_STATUS=1`，用完关掉 |
-| WebSocket              | 路径不设限，任意路径都能升级                                                                                                |
+| `GET /api/info`        | `{"publicUrl","protocol"}`                                                                                                                                                                          |
+| `GET /api/pair-status` | **默认 404**。无需认证地回答"配对码 N 是否有效"，等于给 6 位码空间装了扫描 oracle；确需调试时 `DRC_PAIR_STATUS=1`，用完关掉                                                                         |
+| WebSocket              | 路径不设限，任意路径都能升级                                                                                                                                                                        |
 
 `/healthz` 的 `version` 必须是真实版本号——出现 `0.0.0` 说明部署的不是打包产物。
 
