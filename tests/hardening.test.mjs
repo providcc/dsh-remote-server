@@ -427,3 +427,26 @@ test('计数器按 countersLogMs 抄进日志：累计值从此有历史，且�
     await server.kill()
   }
 })
+
+test('默认上限 1MB：图片附件那一跳的余量（wire 1.3.0 起一条 prompt 可带 4 张 jpeg）', async () => {
+  const server = await boot() // 不带 env = 吃默认值
+  try {
+    const peer = connect(server.url)
+    await peer.opened
+    peer.send({ t: 'hello', role: 'client', clientId: 'big-2' })
+    await waitFrames(peer, 1)
+    // 900KB：一张压过的 jpeg（base64 之后）完全放得下——不许切
+    peer.ws.send(JSON.stringify({ t: 'ping', ts: 'x'.repeat(900 * 1024) }))
+    const survived = await Promise.race([
+      peer.closed.then(() => 'closed'),
+      new Promise((resolve) => setTimeout(() => resolve('open'), 400)),
+    ])
+    assert.equal(survived, 'open', '900KB 的帧被切了：默认上限不是 1MB，或者被别的原因调小了')
+    // 1.2MB：超过默认上限，照旧 1009
+    peer.ws.send(JSON.stringify({ t: 'ping', ts: 'x'.repeat(1200 * 1024) }))
+    const verdict = await peer.closed
+    assert.equal(verdict.code, 1009)
+  } finally {
+    await server.kill()
+  }
+})

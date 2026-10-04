@@ -130,7 +130,11 @@ export function loadConfig(
     bind: env.DRC_BIND || '127.0.0.1',
     publicUrl: env.DRC_PUBLIC_URL ?? '',
     pairTtlMs: integer(env.DRC_PAIR_TTL_MS, 120_000, 'DRC_PAIR_TTL_MS'),
-    maxMessageBytes: integer(env.DRC_MAX_MSG_BYTES, 256 * 1024, 'DRC_MAX_MSG_BYTES'),
+    // 2026-10-04 从 256KB 抬到 1MB：cmd.send_prompt 开始带图片附件（wire 1.3.0）。
+    // 一张 q0.6/最长边 1600 的 jpeg 约 80-250KB，base64 后 +33%，256KB 连一张都紧巴。
+    // 1MB 给到 4 张（协议层上限）的余量，同时仍远小于 maxBufferedBytes 的上游量级，
+    // 而且零知识的规矩不变：中继照样只当密文转发，看不懂也改不了。
+    maxMessageBytes: integer(env.DRC_MAX_MSG_BYTES, 1024 * 1024, 'DRC_MAX_MSG_BYTES'),
     maxConnections: integer(env.DRC_MAX_CONNS, 200, 'DRC_MAX_CONNS'),
     maxFramesPerSec: integer(env.DRC_MAX_FRAMES_PER_SEC, 500, 'DRC_MAX_FRAMES_PER_SEC'),
     maxHostAuthAttempts: integer(env.DRC_HOST_AUTH_MAX_ATTEMPTS, 5, 'DRC_HOST_AUTH_MAX_ATTEMPTS'),
