@@ -4,7 +4,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 **DSH Remote Control** 的零知识 WebSocket 中继：在跑 DSH 的桌面主机与已配对的手机之间转发密封记录。
-它是一个单进程、纯内存的服务，运行时只依赖 [`ws`](https://www.npmjs.com/package/ws)。
+它是一个单进程、纯内存的服务：**产物零运行时依赖**——`ws` 与协议层
+（[`dsh-remote-wire`](https://www.npmjs.com/package/dsh-remote-wire)）都被内联进那一个文件，
+源码树里它们才是依赖。分发只有两条：GitHub Release 上那个单文件产物（配 `SHA256SUMS`），
+或从源码构建。**本仓不发 npm**——`dsh-remote-server` 这个包名属于另一个无关项目
+（`bondzhu` / `MRZHUH/dsh-remote-server`，一个"在 DSH 会话里 @ 服务器走 SSH 执行命令"的工具），
+所以**别照抄任何 `npm i -g dsh-remote-server`**，那条装到的是别人的东西。
 
 ## 零知识是什么意思
 
@@ -28,6 +33,8 @@
 ## 快速开始
 
 要求 **Node.js ≥ 20**（`.nvmrc` 里是 22）。生产入口是**一个自包含单文件**：`dist/bundle/main.js`。
+
+从源码跑：
 
 ```sh
 pnpm install
@@ -89,6 +96,9 @@ DRC_HOST_TOKEN=smoke-token-0123456789abcdef DRC_PORT=0 node relay.mjs
 `/healthz` 的 `version` 必须是真实版本号——出现 `0.0.0` 说明部署的不是打包产物。
 
 ## 部署
+
+两条路，产物是同一个文件：**GitHub Release 上挂的那一个 `.mjs`**（scp + systemd，
+见 `deploy/`）与**从源码构建**。生产上现在跑的是第一条。本仓不发 npm（原因见顶部）。
 
 `deploy/` 里是**正在生产使用**的配置，不是示例：
 

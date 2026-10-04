@@ -106,3 +106,32 @@ test('协议包声明 sideEffects:false —— 上面那条零知识保证的前
   assert.equal(pkg.sideEffects, false, '没有这条，打包器不会把 record/keys 从产物里摇掉')
   assert.ok(!('tweetnacl' in (pkg.dependencies ?? {})) === false, 'tweetnacl 仍是协议包的运行时依赖（插件要用）')
 })
+
+/**
+ * 分发决策的闸门：**本仓不发 npm**。原因很硬——`dsh-remote-server` 这个包名在 npm 上属于
+ * 另一个无关项目（`bondzhu` / `MRZHUH/dsh-remote-server`，一个"在 DSH 会话里 @ 服务器走 SSH
+ * 执行命令"的工具），2026-10-03 用户拍板"先不发"。
+ * 这里钉的是**别半发**：半发的形状是 package.json 去掉了 private、release.yml 里多了一步
+ * publish，而包名撞墙——结局要么红在 CI，要么更糟：装到别人的东西。
+ * 末尾两条与发不发无关，是产物事实：运行时依赖为空、shebang 在第一行。
+ */
+test('本仓不发 npm：private 必须为 true，release.yml 里不许出现发包步骤与 id-token', () => {
+  const root = path.join(path.dirname(new URL(import.meta.url).pathname), '..')
+  const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
+  assert.equal(pkg.private, true, 'private 被去掉了：那意味着有人准备发包，但这个名字是别人的')
+  assert.equal(pkg.bin, undefined, 'bin 是发包才需要的东西，留着它会让人以为 npm 上装得到')
+  assert.equal(pkg.files, undefined, 'files 白名单同理：它只会诱导别人去 npm pack 一个私有包')
+  const workflow = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8')
+  assert.doesNotMatch(workflow, /(npm|pnpm)\s+(publish|pack)\b/, 'release.yml 里出现了发包步骤，而本仓不发 npm')
+  assert.doesNotMatch(workflow, /id-token: write/, 'id-token 只为 OIDC provenance 存在；不发 npm 就不该申请这个权限')
+  assert.deepEqual(
+    pkg.dependencies,
+    {},
+    '产物已内联 ws/zod/dsh-remote-wire，运行时依赖必须是空：列了就是让源码消费者白拉一棵树',
+  )
+  assert.equal(
+    readFileSync(BUNDLE, 'utf8').split('\n', 1)[0],
+    '#!/usr/bin/env node',
+    'shebang 必须在第一行，否则 chmod +x 之后 ./relay.mjs 起不来',
+  )
+})

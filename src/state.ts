@@ -20,7 +20,6 @@
  * 所以状态机可以被纯内存的单测完整驱动，不需要真的起 socket。
  */
 import { newConversationId } from 'dsh-remote-wire/ids'
-import type { ClientMeta } from 'dsh-remote-wire/frames'
 
 /** 对端 socket 的最小面（真实现是 `ws` 的 WebSocket，测试里可以是内存对象）。 */
 export interface Sock {
@@ -39,7 +38,6 @@ export interface HostEntry {
 
 export interface ClientEntry {
   ws: Sock
-  meta?: ClientMeta
 }
 
 /** 待配对条目。**没有 psk 字段**——中继从不知道密钥（D1）。 */
@@ -58,12 +56,20 @@ export interface Conversation {
   lastActivityAt: number
   /** 主机 socket 掉线的时刻；超过宽限期才真正通知客户端（D6）。 */
   hostOfflineSince?: number
+  /**
+   * 最后一个客户端离开**成员表**的时刻（P2-⑤ 空会话回收的计时基线）。
+   *
+   * 只在成员表真的空了时打点：`session-leave` 或重配 detach。
+   * socket 断开不算——那是 D3 重挂的机制（成员留着、手机回前台原样接上），
+   * 把断开当成空会话会直接违反"免扫码"那条设计。
+   */
+  emptySince?: number
 }
 
 export type ClaimResult =
   { ok: true; conversationId: string; hostId: string; detached: string[] } | { ok: false; reason: PairRejectReason }
 
-export type PairRejectReason = 'invalid_or_expired' | 'already_used' | 'host_offline' | 'rate_limited'
+export type PairRejectReason = 'invalid_or_expired' | 'already_used' | 'host_offline'
 
 export interface Clock {
   now(): number
@@ -110,9 +116,9 @@ export class RelayState implements Clock {
    * 用的还是存储里那个 installId，若这里另发一个，D3 的重挂与 D4 的成员校验
    * 会在下一次冷启动时永远对不上。
    */
-  attachClient(clientId: string, ws: Sock, meta?: ClientMeta): { replaced?: Sock } {
+  attachClient(clientId: string, ws: Sock): { replaced?: Sock } {
     const previous = this.clients.get(clientId)
-    this.clients.set(clientId, { ws, ...(meta ? { meta } : {}) })
+    this.clients.set(clientId, { ws })
     // 复核 R3：clientId 虽然不是凭据，但**同 id 必须有唯一活动连接**。
     // 旧写法直接覆盖，结果抢注方拿到路由、真手机的 socket 还"开着"（因此不会重连），
     // 表现是手机侧永久静默。顶号让双方都能立刻看到断开，各自按策略重来。
@@ -122,10 +128,6 @@ export class RelayState implements Clock {
   /** 该 socket 当前是否仍是某个身份的活连接（close 回调的竞态守卫）。 */
   isLiveHost(hostId: string, ws: Sock): boolean {
     return this.hosts.get(hostId)?.ws === ws
-  }
-
-  isLiveClient(clientId: string, ws: Sock): boolean {
-    return this.clients.get(clientId)?.ws === ws
   }
 
   // ── 配对 ────────────────────────────────────────────────────────────
@@ -223,6 +225,9 @@ export class RelayState implements Clock {
       if (claimed.has(conversationId)) {
         conv.hostOfflineSince = undefined
         conv.lastActivityAt = this.now()
+        // 主机重启后重新声明的会话：成员表它自己的重连会补上，此刻仍是空的就**从这一刻**
+        // 起算空会话回收——否则一条重启前就被掏空的会话会因为没人打点而挂到 7 天。
+        this.markEmpty(conv, this.now())
         continue
       }
       this.conversations.delete(conversationId)
@@ -354,8 +359,20 @@ export class RelayState implements Clock {
   leave(clientId: string, conversationId: string): boolean {
     const conv = this.conversations.get(conversationId)
     if (!conv || !conv.clients.delete(clientId)) return false
-    conv.lastActivityAt = this.now()
+    const now = this.now()
+    conv.lastActivityAt = now
+    this.markEmpty(conv, now)
     return true
+  }
+
+  /** 成员表空了的就打上回收计时；一旦还有成员（比如同一台手机重挂）就撤销。 */
+  private markEmpty(conv: Conversation, now: number): void {
+    if (conv.clients.size === 0) {
+      if (conv.emptySince === undefined) conv.emptySince = now
+
+      return
+    }
+    conv.emptySince = undefined
   }
 
   /**
@@ -371,8 +388,12 @@ export class RelayState implements Clock {
    */
   leaveAll(clientId: string): string[] {
     const touched: string[] = []
+    const now = this.now()
     for (const [conversationId, conv] of this.conversations) {
-      if (conv.clients.delete(clientId)) touched.push(conversationId)
+      if (conv.clients.delete(clientId)) {
+        touched.push(conversationId)
+        this.markEmpty(conv, now)
+      }
     }
     return touched
   }
@@ -387,6 +408,33 @@ export class RelayState implements Clock {
     const dropped: string[] = []
     for (const [conversationId, conv] of [...this.conversations]) {
       if (now - conv.lastActivityAt >= ttlMs) {
+        this.conversations.delete(conversationId)
+        dropped.push(conversationId)
+      }
+    }
+    return dropped
+  }
+
+  /**
+   * 空会话回收（P2-⑤）：成员表空了的会话，最后一个客户端走了 `emptyTtlMs` 就删。
+   *
+   * 与 `sweepIdle`（7 天）是两条互补的规则，刻意都用**宽松**的一侧：
+   * - `sweepIdle` 管"两头都在、只是不说话"——手机可能只是退了首页；
+   * - 这里管"只剩主机"——手机明确走了（`session-leave`）或被重配挤掉，
+   *   而它回不来：成员表空了之后没有任何路径能把它加回来，除了重新扫码开新会话。
+   *
+   * 默认 30 分钟（远小于 7 天）：删的代价是手机再扫一次码，不删的代价是
+   * 中继的 `conversations` 计数永远虚高、排障时对不上真实通道数。
+   *
+   * 与 D3 的关系：socket 断开**不打点**（`clientGone` 不动成员表），
+   * 所以"手机回前台免扫码"这条设计一行没碰。
+   */
+  sweepEmpty(emptyTtlMs: number): string[] {
+    const now = this.now()
+    const dropped: string[] = []
+    for (const [conversationId, conv] of [...this.conversations]) {
+      if (conv.emptySince === undefined) continue
+      if (now - conv.emptySince >= emptyTtlMs) {
         this.conversations.delete(conversationId)
         dropped.push(conversationId)
       }

@@ -378,3 +378,75 @@ test('同一 hostId 顶号：旧 socket 收到 4000，会话与已配对的客�
     await server.kill()
   }
 })
+
+/**
+ * 计数器快照必须**进日志**，不是只有 `/healthz`。
+ *
+ * 判据的来源是一条真实查不下去的账：`droppedFrames` 这类是"自启动累计"，进程一换就归零，
+ * 而中继又不为每一次丢帧写日志（那是刷屏），于是"昨天那段时间丢了多少"以前问不出来
+ * （伞仓 HANDOFF §3.3）。这一条钉的就是"它从此在 journalctl 里可查"。
+ * 字段必须与 `/healthz` 同源（复用 `health()`）——两边各列一遍迟早分叉。
+ */
+test('计数器按 countersLogMs 抄进日志：累计值从此有历史，且与 /healthz 同一组字段', async () => {
+  // 清扫 50ms 一轮、快照 400ms 一条，跑 1.2s：**不节流**的话这里会有二十来条。
+  const server = await boot({ DRC_SWEEP_MS: '50', DRC_COUNTERS_LOG_MS: '400' })
+  try {
+    await sleep(1200)
+    const snaps = server.lines.map((line) => JSON.parse(line)).filter((r) => r.msg === 'counters')
+    assert.ok(snaps.length >= 2, `400ms 一抄的周期在 1.2s 里至少该出两条，实际 ${snaps.length} 条`)
+    assert.ok(
+      snaps.length <= 6,
+      `一个周期抄出 ${snaps.length} 条：节流没生效（清扫周期是 50ms，不节流就是二十来条），日志会被它刷满`,
+    )
+    for (const key of [
+      'ok',
+      'version',
+      'uptimeSec',
+      'hosts',
+      'clients',
+      'conversations',
+      'pendingPairs',
+      'droppedFrames',
+      'slowConsumers',
+      'rejectedPairs',
+      'lastPingAgo',
+      'shuttingDown',
+    ]) {
+      assert.ok(key in snaps[0], `快照里少了 ${key}：这一行必须能顶替当时没人 curl 的 /healthz`)
+    }
+    // 累计值只许不减（它减了就是"抄错了对象"或者进程被换过）。
+    for (const key of ['droppedFrames', 'slowConsumers', 'rejectedPairs', 'uptimeSec']) {
+      for (let i = 1; i < snaps.length; i++) {
+        assert.ok(snaps[i][key] >= snaps[i - 1][key], `${key} 在两条快照之间变小了：累计计数不许倒退`)
+      }
+    }
+    // 这一行会长期留在服务器日志里，所以它一个字都不许带上凭据。
+    const dumped = JSON.stringify(snaps)
+    assert.equal(/hostToken|"token"|psk|secret/i.test(dumped), false, '计数器快照里出现了凭据形态的字段')
+  } finally {
+    await server.kill()
+  }
+})
+
+test('默认上限 1MB：图片附件那一跳的余量（wire 1.3.0 起一条 prompt 可带 4 张 jpeg）', async () => {
+  const server = await boot() // 不带 env = 吃默认值
+  try {
+    const peer = connect(server.url)
+    await peer.opened
+    peer.send({ t: 'hello', role: 'client', clientId: 'big-2' })
+    await waitFrames(peer, 1)
+    // 900KB：一张压过的 jpeg（base64 之后）完全放得下——不许切
+    peer.ws.send(JSON.stringify({ t: 'ping', ts: 'x'.repeat(900 * 1024) }))
+    const survived = await Promise.race([
+      peer.closed.then(() => 'closed'),
+      new Promise((resolve) => setTimeout(() => resolve('open'), 400)),
+    ])
+    assert.equal(survived, 'open', '900KB 的帧被切了：默认上限不是 1MB，或者被别的原因调小了')
+    // 1.2MB：超过默认上限，照旧 1009
+    peer.ws.send(JSON.stringify({ t: 'ping', ts: 'x'.repeat(1200 * 1024) }))
+    const verdict = await peer.closed
+    assert.equal(verdict.code, 1009)
+  } finally {
+    await server.kill()
+  }
+})
