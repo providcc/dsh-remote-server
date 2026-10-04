@@ -35,12 +35,6 @@ export class Budget {
     this.left -= 1
     return true
   }
-
-  /** 当前窗口剩余（只为诊断与测试可读）。 */
-  peek(now: number): number {
-    if (now - this.windowAt >= this.windowMs) return this.perWindow
-    return this.left
-  }
 }
 
 /** 违规计数 + 达到上限即断开。 */
@@ -50,10 +44,6 @@ export class Violations {
 
   hit(): boolean {
     this.count += 1
-    return this.count >= this.limit
-  }
-
-  get exhausted(): boolean {
     return this.count >= this.limit
   }
 }

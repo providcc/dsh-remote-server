@@ -28,7 +28,7 @@ jobs:
 
       # 工具链固定 22：pnpm 11.7 要求 Node ≥ 22.13（它 import `node:sqlite`）。
       # 这里原先直接用矩阵版本，于是 node 20 那条腿连 setup-node 的 pnpm 缓存步骤都过不去。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -50,15 +50,22 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # engines 写的是 >=20，那就得真在 20 上把测试跑一遍。测试是普通 JS
-      # （`node --test tests/*.test.mjs`，只是 import ../dist/src/*.js），不经 pnpm，
-      # 所以这里可以把 node 切成矩阵版本。
-      - uses: actions/setup-node@v4
+      # engines 写的是 >=20，那就得真在 20 上把测试跑一遍。测试是普通 JS（import ../dist/src/*.js），
+      # 不经 pnpm，所以这里可以把 node 切成矩阵版本。
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
 
+      # 用 find 显式列文件，而不是把 glob 交给 node：`--test` 的位置参数语义在版本之间变过——
+      # node 20 把它当字面路径（`tests/*.test.mjs` 直接 "Could not find"），node 22 才当 glob。
+      # 文件数还必须先断言非零，否则目录一改名就变成"0 个测试全绿"。
       - name: Run tests on node ${{ matrix.node }}
-        run: node --test "tests/*.test.mjs"
+        run: |
+          set -e
+          n="$(find tests -name '*.test.mjs' | wc -l)"
+          echo "测试文件数：$n"
+          [ "$n" -gt 0 ] || { echo "tests 下没找到 *.test.mjs（目录或命名变了？）"; exit 1; }
+          find tests -name '*.test.mjs' -print0 | xargs -0 node --test
 
   # 部署形态的机械防线：在**最低支持版本**上把单文件产物拷进一个空目录，真起一次，
   # 断言 /healthz 的 version 等于包版本、SIGTERM 退出码为 0。这条独立于测试套件，
@@ -73,7 +80,7 @@ jobs:
 
       # 装与打包用 22（pnpm 11.7 的下限），**跑产物**才切到最低支持版本 20——
       # 这条 job 要证明的是"一个文件在 node 20 上能跑"，不是"pnpm 能在 20 上装"。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -85,7 +92,7 @@ jobs:
       - name: Build the single-file artifact
         run: pnpm build
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
 

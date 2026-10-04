@@ -38,9 +38,27 @@ export interface RelayConfig {
   pairGlobalBudgetPerSec: number
   maxPendingPairs: number
   conversationIdleTtlMs: number
+  /** 空会话（成员表一个客户端都不剩）回收时限：最后一个客户端离开起算。 */
+  conversationEmptyTtlMs: number
   hostGraceMs: number
   /** 清扫与保活周期。调小它可以让"宽限期到期"这类事件更快被观察到（测试需要）。 */
   sweepMs: number
+  /**
+   * 把计数器快照写进日志的周期。
+   *
+   * 为什么单独一条：`droppedFrames` / `slowConsumers` / `rejectedPairs` 是**自启动累计**，
+   * 只在当前进程的 `/healthz` 里有值，进程一换就归零，而中继本来不为每一次丢帧写日志
+   * （那是刷屏）。于是"昨天那段时间丢了多少"这种问题以前根本没法问。
+   * 这一条就是把 `/healthz` 的那组数按周期抄进日志，让它进 journalctl 成为历史。
+   */
+  countersLogMs: number
+  /**
+   * 一条连接两次被 ping 之间的目标间隔。心跳**突发**的规模由它和 sweepMs 的关系决定，
+   * 但它**不影响**表清扫的粒度（那仍是 sweepMs）——见 server.ts 的 sweep/sweepPingBucket。
+   */
+  pingIntervalMs: number
+  /** ping 轮转的步长：每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。 */
+  pingTickMs: number
   maxBufferedBytes: number
   /** 慢消费者（发送缓冲持续超限）的判定窗口，按角色分：见 limits.ts 的推导。 */
   slowConsumerHostMs: number
@@ -114,7 +132,11 @@ export function loadConfig(
     bind: env.DRC_BIND || '127.0.0.1',
     publicUrl: env.DRC_PUBLIC_URL ?? '',
     pairTtlMs: integer(env.DRC_PAIR_TTL_MS, 120_000, 'DRC_PAIR_TTL_MS'),
-    maxMessageBytes: integer(env.DRC_MAX_MSG_BYTES, 256 * 1024, 'DRC_MAX_MSG_BYTES'),
+    // 2026-10-04 从 256KB 抬到 1MB：cmd.send_prompt 开始带图片附件（wire 1.3.0）。
+    // 一张 q0.6/最长边 1600 的 jpeg 约 80-250KB，base64 后 +33%，256KB 连一张都紧巴。
+    // 1MB 给到 4 张（协议层上限）的余量，同时仍远小于 maxBufferedBytes 的上游量级，
+    // 而且零知识的规矩不变：中继照样只当密文转发，看不懂也改不了。
+    maxMessageBytes: integer(env.DRC_MAX_MSG_BYTES, 1024 * 1024, 'DRC_MAX_MSG_BYTES'),
     maxConnections: integer(env.DRC_MAX_CONNS, 200, 'DRC_MAX_CONNS'),
     maxFramesPerSec: integer(env.DRC_MAX_FRAMES_PER_SEC, 500, 'DRC_MAX_FRAMES_PER_SEC'),
     maxHostAuthAttempts: integer(env.DRC_HOST_AUTH_MAX_ATTEMPTS, 5, 'DRC_HOST_AUTH_MAX_ATTEMPTS'),
@@ -122,8 +144,15 @@ export function loadConfig(
     pairGlobalBudgetPerSec: integer(env.DRC_PAIR_GLOBAL_PER_SEC, 20, 'DRC_PAIR_GLOBAL_PER_SEC'),
     maxPendingPairs: integer(env.DRC_MAX_PENDING_PAIRS, 1000, 'DRC_MAX_PENDING_PAIRS'),
     conversationIdleTtlMs: integer(env.DRC_CONV_IDLE_TTL_MS, 7 * 24 * 3600 * 1000, 'DRC_CONV_IDLE_TTL_MS'),
+    // P2-⑤（2026-10-04 用户拍板 30 分钟）：远小于 7 天的空闲 TTL。
+    // 删的代价是手机再扫一次码；不删的代价是 conversations 计数虚高、排障对不上。
+    // socket 断开不打点（D3 免扫码），这条只管"只剩主机"的真空会话。
+    conversationEmptyTtlMs: integer(env.DRC_CONV_EMPTY_TTL_MS, 30 * 60 * 1000, 'DRC_CONV_EMPTY_TTL_MS'),
     hostGraceMs: integer(env.DRC_HOST_GRACE_MS, 120_000, 'DRC_HOST_GRACE_MS'),
     sweepMs: integer(env.DRC_SWEEP_MS, 5_000, 'DRC_SWEEP_MS'),
+    countersLogMs: integer(env.DRC_COUNTERS_LOG_MS, 60_000, 'DRC_COUNTERS_LOG_MS'),
+    pingIntervalMs: integer(env.DRC_PING_INTERVAL_MS, 60_000, 'DRC_PING_INTERVAL_MS'),
+    pingTickMs: integer(env.DRC_PING_TICK_MS, 1_000, 'DRC_PING_TICK_MS'),
     maxBufferedBytes: integer(env.DRC_MAX_BUFFERED_BYTES, 1024 * 1024, 'DRC_MAX_BUFFERED_BYTES'),
     slowConsumerHostMs: integer(env.DRC_SLOW_CONSUMER_HOST_MS, HOST_SLOW_CONSUMER_MS, 'DRC_SLOW_CONSUMER_HOST_MS'),
     slowConsumerClientMs: integer(
