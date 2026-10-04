@@ -579,11 +579,11 @@ export function createRelay(config: RelayConfig): RelayHandle {
   // ── 清扫与保活 ──────────────────────────────────────────────────────
 
   /**
-   * 表清扫：每 `sweepMs`（默认 5 s）一轮，只做与"表项的生命周期"有关的四件事。
+   * 表清扫：每 `sweepMs`（默认 5 s）一轮，只做与"表项的生命周期"有关的五件事。
    *
    * **这一条的周期不能跟着心跳一起变长**（C1 最容易做错的地方）：配对码 TTL 120 s 的
-   * 失效粒度、慢消费者窗口（主机 10 s / 客户端 45 s）、host 宽限期 120 s、会话空闲剪枝，
-   * 全都挂在这个轮次上。把 `DRC_SWEEP_MS` 直接调到 60 s 来"省 ping"会让上面四条
+   * 失效粒度、慢消费者窗口（主机 10 s / 客户端 45 s）、host 宽限期 120 s、会话空闲剪枝、
+   * 空会话回收，全都挂在这个轮次上。把 `DRC_SWEEP_MS` 直接调到 60 s 来"省 ping"会让上面五条
    * 一起退化成 60 s 粒度——所以拆成两条定时任务，而不是调同一个间隔。
    */
   function sweep(): void {
@@ -607,6 +607,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
     }
     for (const conversationId of state.sweepIdle(config.conversationIdleTtlMs)) {
       log.info('conversation idle-dropped', { sessionId: conversationId })
+    }
+    // P2-⑤：只剩主机、没有客户端的会话，最后一个客户端走后 emptyTtl 就回收。
+    // 不发任何帧给谁：这条路上"还有客户端"这件事已经不成立（有客户端也不会进这里），
+    // 而主机侧会话本来就与中继这张表各自独立（resync 会重新声明）。
+    for (const conversationId of state.sweepEmpty(config.conversationEmptyTtlMs)) {
+      log.info('conversation empty-dropped', { sessionId: conversationId })
     }
     // 计数器快照借这一轮的节拍，但它**不是**表项生命周期的一部分（见 logCountersIfDue 的注释）。
     logCountersIfDue()

@@ -38,6 +38,8 @@ export interface RelayConfig {
   pairGlobalBudgetPerSec: number
   maxPendingPairs: number
   conversationIdleTtlMs: number
+  /** 空会话（成员表一个客户端都不剩）回收时限：最后一个客户端离开起算。 */
+  conversationEmptyTtlMs: number
   hostGraceMs: number
   /** 清扫与保活周期。调小它可以让"宽限期到期"这类事件更快被观察到（测试需要）。 */
   sweepMs: number
@@ -142,6 +144,10 @@ export function loadConfig(
     pairGlobalBudgetPerSec: integer(env.DRC_PAIR_GLOBAL_PER_SEC, 20, 'DRC_PAIR_GLOBAL_PER_SEC'),
     maxPendingPairs: integer(env.DRC_MAX_PENDING_PAIRS, 1000, 'DRC_MAX_PENDING_PAIRS'),
     conversationIdleTtlMs: integer(env.DRC_CONV_IDLE_TTL_MS, 7 * 24 * 3600 * 1000, 'DRC_CONV_IDLE_TTL_MS'),
+    // P2-⑤（2026-10-04 用户拍板 30 分钟）：远小于 7 天的空闲 TTL。
+    // 删的代价是手机再扫一次码；不删的代价是 conversations 计数虚高、排障对不上。
+    // socket 断开不打点（D3 免扫码），这条只管"只剩主机"的真空会话。
+    conversationEmptyTtlMs: integer(env.DRC_CONV_EMPTY_TTL_MS, 30 * 60 * 1000, 'DRC_CONV_EMPTY_TTL_MS'),
     hostGraceMs: integer(env.DRC_HOST_GRACE_MS, 120_000, 'DRC_HOST_GRACE_MS'),
     sweepMs: integer(env.DRC_SWEEP_MS, 5_000, 'DRC_SWEEP_MS'),
     countersLogMs: integer(env.DRC_COUNTERS_LOG_MS, 60_000, 'DRC_COUNTERS_LOG_MS'),

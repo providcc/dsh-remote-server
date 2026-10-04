@@ -291,3 +291,66 @@ test('leaveAll：一个 clientId 只会留在最后一次认领的会话里', ()
   assert.equal(state.conversations.get(b.conversationId).clients.size, 0)
   assert.deepEqual(state.leaveAll('不存在的客户端'), [], '不认识的 clientId 不许抛')
 })
+
+test('P2-⑤ 空会话回收：最后一个客户端离开起算；socket 断开不算（D3 免扫码不受影响）', () => {
+  const { state, client, advance } = harness()
+  state.issuePair('h1', '123456', 180_000)
+  const { conversationId } = state.claim('123456', 'inst-1')
+
+  // 手机 socket 断开：成员表不动、**不打**回收计时——这是 D3 重挂的机制本身。
+  state.clientGone('inst-1', client)
+  assert.equal(
+    state.conversations.get(conversationId).emptySince,
+    undefined,
+    'socket 断开被当成空会话：手机回前台就要重新扫码，直接违反 D3',
+  )
+
+  // 手机显式 session-leave：成员表空了才开始计时。
+  assert.equal(state.leave('inst-1', conversationId), true)
+  const conv = state.conversations.get(conversationId)
+  assert.equal(conv.clients.size, 0)
+  assert.ok(typeof conv.emptySince === 'number', '最后一个客户端走了要打上计时基线')
+
+  const ttl = 30 * 60 * 1000
+  advance(ttl - 1)
+  assert.deepEqual(state.sweepEmpty(ttl), [], '没到 30 分钟不许回收')
+  advance(1)
+  assert.deepEqual(state.sweepEmpty(ttl), [conversationId], '到点就回收（默认值 30 分钟，P2-⑤ 用户拍板）')
+  assert.equal(state.conversations.size, 0)
+})
+
+test('P2-⑤ 还有客户端的会话永不回收；重配 detach 也会起算', () => {
+  const { state, advance } = harness()
+  state.issuePair('h1', '111111', 180_000)
+  state.issuePair('h1', '222222', 180_000)
+  const a = state.claim('111111', 'inst-a')
+  const b = state.claim('222222', 'inst-b')
+  const ttl = 30 * 60 * 1000
+
+  advance(ttl * 2)
+  assert.deepEqual(state.sweepEmpty(ttl), [], '两边都还有客户端：一个都不许动')
+
+  // inst-a 重配：新 claim 会把它从旧会话摘干净（复核 🟡7），旧会话至此空了。
+  state.issuePair('h1', '333333', 180_000)
+  const c = state.claim('333333', 'inst-a')
+  assert.ok(c.detached.includes(a.conversationId), '重配必须把旧会话里的自己摘掉')
+  assert.equal(state.conversations.get(a.conversationId).clients.size, 0)
+  assert.equal(state.conversations.get(b.conversationId).clients.size, 1)
+
+  advance(ttl)
+  assert.deepEqual(state.sweepEmpty(ttl), [a.conversationId], '只回收空了的那条')
+  assert.equal(state.conversations.has(b.conversationId), true, '还有客户端的必须留着')
+  assert.equal(state.conversations.has(c.conversationId), true, '新会话更得留着')
+})
+
+test('P2-⑤ resync 时才知道的空会话：从这一时刻起算，不会挂到 7 天', () => {
+  const { state, advance } = harness()
+  state.issuePair('h1', '123456', 180_000)
+  const { conversationId } = state.claim('123456', 'inst-1')
+  state.leave('inst-1', conversationId)
+  // 主机重启后重新声明这条会话（resync 保留它）。
+  state.resync('h1', [conversationId])
+  const ttl = 30 * 60 * 1000
+  advance(ttl)
+  assert.deepEqual(state.sweepEmpty(ttl), [conversationId], '重启前就掏空的会话也不许多挂')
+})
