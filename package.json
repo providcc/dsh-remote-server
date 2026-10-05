@@ -40,7 +40,7 @@
   "devDependencies": {
     "@types/node": "^26.6.3",
     "@types/ws": "^8.5.12",
-    "dsh-remote-wire": "file:/Users/linbin/dsh-remote-control/dsh-remote-protocol",
+    "dsh-remote-wire": "^1.8.0",
     "esbuild": "^0.28.2",
     "prettier": "^3.3.3",
     "typescript": "^7.0.2",

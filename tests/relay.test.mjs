@@ -941,7 +941,6 @@ test('/healthz 诊断计数：丢弃帧 / 慢消费者 / 被拒配对 都有出�
   }
 })
 
-
 /**
  * 掉线与解配必须能在主机那边分开（2026-10-05 用户报：解配后 pill 显示「手机离线」）。
  *
@@ -956,13 +955,8 @@ test('socket 关闭的 peer-left 不许带 unpaired：D3（掉线不解除配对
     client.ws.terminate()
     const left = await host.until((f) => f.t === 'peer-left')
     assert.equal(left.sessionId, conversationId)
-    assert.equal(
-      left.unpaired,
-      undefined,
-      '掉线也标成了 unpaired：手机切后台就被要求重新扫码（D3 这条命脉不能动）',
-    )
+    assert.equal(left.unpaired, undefined, '掉线也标成了 unpaired：手机切后台就被要求重新扫码（D3 这条命脉不能动）')
   } finally {
     await ctx.close()
   }
 })
-
