@@ -306,7 +306,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
     // 这里补上对旧主机的告知：与"客户端显式 session-leave"走同一条通知（`peer-left`），
     // 主机才知道少了这个观众，不必再往那个会话里推。（会话本身仍归主机。）
     for (const old of claimed.detached) {
-      sendTo(state.hostSocket(old), peerLeftFrame(old, peer.clientId))
+      // 同样标 unpaired：这台手机已经带着**新**的 convId 走了，旧会话在主机那边
+      // 再也不会有人回来，不标的话那条幽灵会一直挂在 pill 上。
+      sendTo(state.hostSocket(old), peerLeftFrame(old, peer.clientId, true))
     }
     sendToPeer(peer, pairedFrameOf(claimed.conversationId, claimed.hostId))
     // 发给主机的那一条**必须带 pairingToken**：主机按它取自己那份 PSK（多码并存事故）。
@@ -448,7 +450,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
         }
         const removed = state.leave(peer.clientId, frame.sessionId)
         if (removed) {
-          sendTo(state.hostSocket(frame.sessionId), peerLeftFrame(frame.sessionId, peer.clientId))
+          // unpaired=true：这一条是**用户主动解的**，不是掉线。
+          // mp 的 unpair() 会立刻 _forgetPairing() 清掉 convId，它再也不会回来了，
+          // 主机留着这条会话就只剩一条永远清不掉的幽灵，pill 于是永远说「手机离线」
+          // （2026-10-05 用户报）。socket 关闭那条路**不带**这个标记 —— 那条是掉线，
+          // D3 要求会话留着，回前台还要用同一把钥匙。
+          sendTo(state.hostSocket(frame.sessionId), peerLeftFrame(frame.sessionId, peer.clientId, true))
         }
         return
       }
