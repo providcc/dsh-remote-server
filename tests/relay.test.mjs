@@ -534,6 +534,15 @@ test('session-leave：客户端主动退出只摘自己，主机收到 peer-left
     assert.equal(left.sessionId, conversationId)
     assert.equal(ctx.relay.state.conversations.get(conversationId).clients.size, 0)
     assert.equal(ctx.relay.state.conversations.has(conversationId), true)
+    // unpaired 必须带上（2026-10-05）：这一条与「socket 断了」是同一帧，
+    // 主机全靠它区分「用户解配」和「掉线」。不带的话主机按 D3 留着会话，
+    // 手机那边却已经 _forgetPairing() 清了 convId 再也不回来 ——
+    // pill 于是永远显示「手机离线」，用户永远等不到「未配对」。
+    assert.equal(
+      left.unpaired,
+      true,
+      '客户端主动 session-leave 没有标 unpaired：主机分不出解配与掉线，这条幽灵会话永远清不掉',
+    )
   } finally {
     await ctx.close()
   }
@@ -931,3 +940,29 @@ test('/healthz 诊断计数：丢弃帧 / 慢消费者 / 被拒配对 都有出�
     await ctx.close()
   }
 })
+
+
+/**
+ * 掉线与解配必须能在主机那边分开（2026-10-05 用户报：解配后 pill 显示「手机离线」）。
+ *
+ * 这一条钉的是**另一半**：socket 关闭发出去的 peer-left **不许**带 unpaired。
+ * 带错了，手机切一下后台主机就把配对作废 → 用户每次回前台都要重新扫码，
+ * 那正是 D3 要防的产品缺陷，而且比原 bug 更隐蔽（只在切后台时发生）。
+ */
+test('socket 关闭的 peer-left 不许带 unpaired：D3（掉线不解除配对）必须原样', async () => {
+  const ctx = await startRelay()
+  try {
+    const { host, client, conversationId } = await pairUp(ctx)
+    client.ws.terminate()
+    const left = await host.until((f) => f.t === 'peer-left')
+    assert.equal(left.sessionId, conversationId)
+    assert.equal(
+      left.unpaired,
+      undefined,
+      '掉线也标成了 unpaired：手机切后台就被要求重新扫码（D3 这条命脉不能动）',
+    )
+  } finally {
+    await ctx.close()
+  }
+})
+

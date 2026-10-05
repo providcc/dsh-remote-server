@@ -15,8 +15,8 @@ importers:
         specifier: ^8.5.12
         version: 8.18.2
       dsh-remote-wire:
-        specifier: ^1.0.0
-        version: 1.0.0
+        specifier: file:/Users/linbin/dsh-remote-control/dsh-remote-protocol
+        version: file:../dsh-remote-protocol
       esbuild:
         specifier: ^0.28.2
         version: 0.28.2
@@ -314,8 +314,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  dsh-remote-wire@1.0.0:
-    resolution: {integrity: sha512-mxU53HJLAoe2VsA6SYBNcW6oAWzaPLdMcjOQoRNbQA7GvHVz4kmMbCydL8HgFG8aNNSMDR+6zMV8FOnK7QVmLQ==}
+  dsh-remote-wire@file:../dsh-remote-protocol:
+    resolution: {directory: ../dsh-remote-protocol, type: directory}
     engines: {node: '>=20'}
 
   esbuild@0.28.2:
@@ -502,7 +502,7 @@ snapshots:
   '@typescript/typescript-win32-x64@7.0.2':
     optional: true
 
-  dsh-remote-wire@1.0.0:
+  dsh-remote-wire@file:../dsh-remote-protocol:
     dependencies:
       tweetnacl: 1.0.3
       zod: 4.6.5
