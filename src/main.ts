@@ -56,6 +56,10 @@ async function main(): Promise<void> {
     relay.log.info('shutting down', { signal })
     const guard = setTimeout(() => {
       relay.log.warn('shutdown timed out, forcing exit')
+      // 兜底路径也要补写一次盘：排空超时说明还有在途连接，但内存表仍是此刻最新的真相，
+      // 不写就等于把这次停机期间的变更丢掉。`shutdownForced` 同步进 /healthz——
+      // 这条 exit(0) 与"排空成功"同一个码，只有计数能让运维事后分辨。
+      relay.forceShutdown()
       process.exit(0)
     }, 5000)
     guard.unref()

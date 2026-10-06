@@ -65,32 +65,35 @@ scp deploy/systemd/dsh-remote-control.service root@HOST:/etc/systemd/system/
 权威来源是 `src/config.ts`，逐条抄自代码。**没有 `DRC_HOST_TOKEN` 服务拒绝启动**
 （stderr 打 `[drc-relay] error: DRC_HOST_TOKEN is required (...)`，exit 1）。
 
-| 变量                         | 必填 | 默认                | 单位   | 说明                                                                                                                                                                                                                 |
-| ---------------------------- | ---- | ------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DRC_HOST_TOKEN`             | ✅   | —                   | —      | host 出站认证凭据。`openssl rand -hex 32` 生成；短于 24 字符只告警不阻止。**与主机插件那一份必须逐字一致**                                                                                                           |
-| `DRC_PORT`                   |      | `8787`              | 端口号 | 监听端口。`0` 合法 = 让系统分配（测试与容器发布端口用）。越界（非 0-65535 整数）直接拒绝启动                                                                                                                         |
-| `DRC_BIND`                   |      | `127.0.0.1`         | IP     | 绑定地址。默认只绑回环：TLS 由反代终止，中继没理由出现在局域网里。**只有自己就是边缘（容器直接发布端口、无同机反代）时才设 `0.0.0.0`**                                                                               |
-| `DRC_PUBLIC_URL`             |      | **空字符串**        | URL    | `/api/info` 返回的对外地址。公网填 `wss://你的域名`                                                                                                                                                                  |
-| `DRC_PAIR_TTL_MS`            |      | `120000`            | 毫秒   | 配对码的**服务端权威**寿命。生产实例实际用 `90000`；建议公网收紧到 60s。主机必须按 `pair-ready.ttlMs` 改写本地过期时间                                                                                               |
-| `DRC_LOG_LEVEL`              |      | `info`              | 枚举   | `debug` / `info` / `warn` / `error` / `silent`。**区分大小写**，写 `INFO` 会拒绝启动                                                                                                                                 |
-| `DRC_MAX_MSG_BYTES`          |      | `1048576`（1 MiB）  | 字节   | 单帧上限（喂给 `ws` 的 `maxPayload`），超过直接 1009 断开。**不要往小调**：低于 256 KiB 会把大的流式 delta 硬切断，表现是"输出说到一半就重连"（图片附件上线时从 256 KiB 提到 1 MiB）                                 |
-| `DRC_MAX_CONNS`              |      | `200`               | 连接数 | 并发连接上限，超出的新连接立刻 1013 `server_busy`                                                                                                                                                                    |
-| `DRC_MAX_FRAMES_PER_SEC`     |      | `500`               | 帧/秒  | 单连接帧速率（固定窗口，每秒重置）。超限时窗口内回一次 `error{rate_limited}`，**累计 3 次违规** → 1008 断开                                                                                                          |
-| `DRC_HOST_AUTH_MAX_ATTEMPTS` |      | `5`                 | 次     | 单连接允许的 host 认证失败次数，用尽 → 4001 `too_many_auth_attempts`                                                                                                                                                 |
-| `DRC_PAIR_ATTEMPTS_PER_CONN` |      | `5`                 | 次     | 单连接允许的配对码错误次数，用尽 → 4008 `too_many_pair_attempts`。**成功一次就清零**                                                                                                                                 |
-| `DRC_PAIR_GLOBAL_PER_SEC`    |      | `20`                | 次/秒  | 全局配对尝试配额。6 位码只有 10⁶ 空间，这一条是唯一的暴力枚举防线                                                                                                                                                    |
-| `DRC_MAX_PENDING_PAIRS`      |      | `1000`              | 条     | 待配对表上限，防无界增长；装满后新码得到 `error{pair_table_full}`（已存在的 token 允许覆盖）                                                                                                                         |
-| `DRC_CONV_IDLE_TTL_MS`       |      | `604800000`（7 天） | 毫秒   | 会话空闲多久后被回收。续用不是无限期                                                                                                                                                                                 |
-| `DRC_CONV_EMPTY_TTL_MS`      |      | `1800000`（30 分）  | 毫秒   | **空会话**回收：最后一个客户端离开后，一条没有任何成员的空会话挂多久被删。与上面那条是两件事——socket 断开（`clientGone`）**不会**起这个表，护的是"小程序退后台再回来不用重扫"（D3）                                  |
-| `DRC_HOST_GRACE_MS`          |      | `120000`（120 秒）  | 毫秒   | 主机 socket 断开后多久才通知客户端"主机已离开"。没有它，一次网络抖动就会让手机丢掉配对                                                                                                                               |
-| `DRC_SWEEP_MS`               |      | `5000`              | 毫秒   | **表清扫**周期：过期配对码清理、慢消费者判定、host 宽限期到期、会话空闲回收、空会话回收五件事挂在它上面。**保活 ping 不在这里**（见下面两行）；调小只为排错（e2e 用 `1000`）                                         |
-| `DRC_COUNTERS_LOG_MS`        |      | `60000`（60 秒）    | 毫秒   | 把 `/healthz` 那组计数器按周期抄进日志（`msg:"counters"`）。`droppedFrames` 这类是**自启动累计**、进程一换就归零，不抄进日志就没法回答"昨天那段时间丢了多少"                                                         |
-| `DRC_PING_INTERVAL_MS`       | ✅   | `60000`（60 秒）    | 毫秒   | 一条连接两次被 ping 之间的目标间隔。**代价**：静默死掉（无 FIN/RST）的半开对端要约 **2 倍**这个时间才被回收，槽位回收变慢就在这里调小                                                                                |
-| `DRC_PING_TICK_MS`           | ✅   | `1000`              | 毫秒   | ping 轮转步长，每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。桶数 = 两者的商（默认 60 桶）                                                                                                           |
-| `DRC_MAX_BUFFERED_BYTES`     |      | `1048576`（1 MiB）  | 字节   | 慢消费者阈值。对端发送缓冲区持续超限 **10 秒**即 1008 `slow_consumer` 断开，而不是无限堆积把中继内存吃掉                                                                                                             |
-| `DRC_PAIR_STATUS`            |      | 关闭                | —      | 设为 `1` **或** `true` 才启用 `/api/pair-status`（默认关闭，见下）                                                                                                                                                   |
-| `DRC_STATE_FILE`             |      | 空（关闭）          | 路径   | 会话表落盘路径。**默认关闭 = 纯内存模式**（与 1.0.6 之前逐字一致，重启丢配对）。标准生产值 `DRC_STATE_FILE=/var/lib/dsh-remote-control/state.json`；相对路径按进程 cwd 解析，systemd 下就是单元的 `WorkingDirectory` |
-| `DRC_STATE_SAVE_MS`          |      | `60000`（60 秒）    | 毫秒   | 周期性补写状态文件的间隔，只为刷新 `lastActivityAt`（它每帧都在变，跟着写就是每帧一次 fsync）。结构性变更（建会话/删会话）本来就会立刻落盘，不靠这一条                                                               |
+| 变量                          | 必填 | 默认                | 单位   | 说明                                                                                                                                                                                                                                                                                     |
+| ----------------------------- | ---- | ------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DRC_HOST_TOKEN`              | ✅   | —                   | —      | host 出站认证凭据。`openssl rand -hex 32` 生成；短于 24 字符只告警不阻止。**与主机插件那一份必须逐字一致**                                                                                                                                                                               |
+| `DRC_PORT`                    |      | `8787`              | 端口号 | 监听端口。`0` 合法 = 让系统分配（测试与容器发布端口用）。越界（非 0-65535 整数）直接拒绝启动                                                                                                                                                                                             |
+| `DRC_BIND`                    |      | `127.0.0.1`         | IP     | 绑定地址。默认只绑回环：TLS 由反代终止，中继没理由出现在局域网里。**只有自己就是边缘（容器直接发布端口、无同机反代）时才设 `0.0.0.0`**                                                                                                                                                   |
+| `DRC_PUBLIC_URL`              |      | **空字符串**        | URL    | `/api/info` 返回的对外地址。公网填 `wss://你的域名`                                                                                                                                                                                                                                      |
+| `DRC_PAIR_TTL_MS`             |      | `120000`            | 毫秒   | 配对码的**服务端权威**寿命。生产实例实际用 `90000`；建议公网收紧到 60s。主机必须按 `pair-ready.ttlMs` 改写本地过期时间                                                                                                                                                                   |
+| `DRC_LOG_LEVEL`               |      | `info`              | 枚举   | `debug` / `info` / `warn` / `error` / `silent`。**区分大小写**，写 `INFO` 会拒绝启动                                                                                                                                                                                                     |
+| `DRC_MAX_MSG_BYTES`           |      | `1048576`（1 MiB）  | 字节   | 单帧上限（喂给 `ws` 的 `maxPayload`），超过直接 1009 断开。**不要往小调**：低于 256 KiB 会把大的流式 delta 硬切断，表现是"输出说到一半就重连"（图片附件上线时从 256 KiB 提到 1 MiB）                                                                                                     |
+| `DRC_MAX_CONNS`               |      | `200`               | 连接数 | 并发连接上限，超出的新连接立刻 1013 `server_busy`                                                                                                                                                                                                                                        |
+| `DRC_MAX_FRAMES_PER_SEC`      |      | `500`               | 帧/秒  | 单连接帧速率（固定窗口，每秒重置）。超限时窗口内回一次 `error{rate_limited}`，**累计 3 次违规** → 1008 断开                                                                                                                                                                              |
+| `DRC_HOST_AUTH_MAX_ATTEMPTS`  |      | `5`                 | 次     | 单连接允许的 host 认证失败次数，用尽 → 4001 `too_many_auth_attempts`                                                                                                                                                                                                                     |
+| `DRC_PAIR_ATTEMPTS_PER_CONN`  |      | `5`                 | 次     | 单连接允许的配对码错误次数，用尽 → 4008 `too_many_pair_attempts`。**成功一次就清零**                                                                                                                                                                                                     |
+| `DRC_PAIR_GLOBAL_PER_SEC`     |      | `20`                | 次/秒  | 全局配对尝试配额。6 位码只有 10⁶ 空间，这一条是唯一的暴力枚举防线                                                                                                                                                                                                                        |
+| `DRC_MAX_PENDING_PAIRS`       |      | `1000`              | 条     | 待配对表上限，防无界增长；装满后新码得到 `error{pair_table_full}`（已存在的 token 允许覆盖）                                                                                                                                                                                             |
+| `DRC_CONV_IDLE_TTL_MS`        |      | `604800000`（7 天） | 毫秒   | 会话空闲多久后被回收。续用不是无限期                                                                                                                                                                                                                                                     |
+| `DRC_CONV_EMPTY_TTL_MS`       |      | `1800000`（30 分）  | 毫秒   | **空会话**回收：最后一个客户端离开后，一条没有任何成员的空会话挂多久被删。与上面那条是两件事——socket 断开（`clientGone`）**不会**起这个表，护的是"小程序退后台再回来不用重扫"（D3）                                                                                                      |
+| `DRC_HOST_GRACE_MS`           |      | `120000`（120 秒）  | 毫秒   | 主机 socket 断开后多久才通知客户端"主机已离开"。没有它，一次网络抖动就会让手机丢掉配对                                                                                                                                                                                                   |
+| `DRC_SWEEP_MS`                |      | `5000`              | 毫秒   | **表清扫**周期：过期配对码清理、慢消费者判定、host 宽限期到期、会话空闲回收、空会话回收五件事挂在它上面。**保活 ping 不在这里**（见下面两行）；调小只为排错（e2e 用 `1000`）                                                                                                             |
+| `DRC_COUNTERS_LOG_MS`         |      | `60000`（60 秒）    | 毫秒   | 把 `/healthz` 那组计数器按周期抄进日志（`msg:"counters"`）。`droppedFrames` 这类是**自启动累计**、进程一换就归零，不抄进日志就没法回答"昨天那段时间丢了多少"                                                                                                                             |
+| `DRC_PING_INTERVAL_MS`        | ✅   | `60000`（60 秒）    | 毫秒   | 一条连接两次被 ping 之间的目标间隔。**代价**：静默死掉（无 FIN/RST）的半开对端要约 **2 倍**这个时间才被回收，槽位回收变慢就在这里调小                                                                                                                                                    |
+| `DRC_PING_TICK_MS`            | ✅   | `1000`              | 毫秒   | ping 轮转步长，每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。桶数 = 两者的商（默认 60 桶）                                                                                                                                                                               |
+| `DRC_MAX_BUFFERED_BYTES`      |      | `1048576`（1 MiB）  | 字节   | 慢消费者阈值：对端发送缓冲区**连续**超限达到**本角色的窗口**才 1008 `slow_consumer` 断开（主机 `DRC_SLOW_CONSUMER_HOST_MS` 10 秒 / 客户端 `DRC_SLOW_CONSUMER_CLIENT_MS` 45 秒），而不是无限堆积把中继内存吃掉。判定由 `DRC_SWEEP_MS` 那一轮**定时驱动**——静默的慢对端同样会被评估        |
+| `DRC_SLOW_CONSUMER_HOST_MS`   | ✅   | `10000`（10 秒）    | 毫秒   | **主机**侧慢消费者窗口。窗口短：主机卡住就是所有人卡住，没有"断开即重连"的对端行为要迁就                                                                                                                                                                                                 |
+| `DRC_SLOW_CONSUMER_CLIENT_MS` | ✅   | `45000`（45 秒）    | 毫秒   | **客户端**侧慢消费者窗口。**必须大于对端自己的重连周期**（小程序 `CONNECT_TIMEOUT_MS` 12s + `RECONNECT_MAX_MS` 30s + 抖动 ≈ 42.5s → 取 45s）：窗口落进周期内，手机每次刚回来就又被踢，会形成永不升级的 ~11s 重连循环（`tests/limits.test.mjs` 直接读对端源码的常量锁这条）。调小只为测试 |
+| `DRC_PAIR_STATUS`             |      | 关闭                | —      | 设为 `1` **或** `true` 才启用 `/api/pair-status`（默认关闭，见下）                                                                                                                                                                                                                       |
+| `DRC_PAIR_STATUS_PER_SEC`     |      | `5`                 | 次/秒  | `/api/pair-status` 的配额（只在上面那条开启时生效）。这是一条**无认证**的"这个 6 位码在不在"判定接口，10⁶ 的码空间不设配额就是一台免费枚举机；超配额回 `429` 并记 `pair-status budget exhausted`。真正的边界仍应由反代限流兜住                                                           |
+| `DRC_STATE_FILE`              |      | 空（关闭）          | 路径   | 会话表落盘路径。**默认关闭 = 纯内存模式**（与 1.0.6 之前逐字一致，重启丢配对）。标准生产值 `DRC_STATE_FILE=/var/lib/dsh-remote-control/state.json`；相对路径按进程 cwd 解析，systemd 下就是单元的 `WorkingDirectory`                                                                     |
+| `DRC_STATE_SAVE_MS`           |      | `60000`（60 秒）    | 毫秒   | 周期性补写状态文件的间隔，只为刷新 `lastActivityAt`（它每帧都在变，跟着写就是每帧一次 fsync）。结构性变更（建会话/删会话）本来就会立刻落盘，不靠这一条                                                                                                                                   |
 
 数值型变量走同一条校验（`integer()`）：**必须是正整数**，`0`、负数、`abc`、小数一律拒绝启动
 （`DRC_PORT` 例外，`0` 合法）。这是相对最初实现的行为变化：旧代码是 `Number(env.X || 默认)`，
@@ -193,28 +196,29 @@ DRC_HOST_TOKEN=smoke-token-0123456789abcdef DRC_PORT=0 node relay.mjs
 curl -s http://127.0.0.1:8787/healthz
 ```
 
-| 字段                 | 类型   | 是否运维契约 | 含义                                                                                                                                               |
-| -------------------- | ------ | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ok`                 | bool   | ✅ **契约**  | `!shuttingDown`。停机中变 `false`                                                                                                                  |
-| `version`            | string | ✅ **契约**  | 包版本。**必须是真实版本号，出现 `0.0.0` 说明部署的不是打包产物**（define 没进去）——`tests/bundle.test.mjs` 与 CI `relay-smoke` 都断言它等于包版本 |
-| `uptimeSec`          | number | ✅ 契约      | 进程已运行秒数                                                                                                                                     |
-| `hosts`              | number | ✅ 契约      | 当前在册主机数                                                                                                                                     |
-| `clients`            | number | ✅ 契约      | 当前在册客户端数                                                                                                                                   |
-| `conversations`      | number | ✅ 契约      | 活跃会话（配对通道）数                                                                                                                             |
-| `pendingPairs`       | number | ✅ 契约      | 待配对表条数。**注意**：已用过的码在 TTL 窗口内仍留在表里（为的是给出 `already_used` 而不是 `invalid_or_expired`），所以这个数会短暂高于你的直觉   |
-| `droppedFrames`      | number | ✅ 契约      | 累计：因对端缓冲区超限而被丢的帧数（只增不减）                                                                                                     |
-| `slowConsumers`      | number | ✅ 契约      | 累计：被以 1008 `slow_consumer` 断开的对端数（只增不减）                                                                                           |
-| `rejectedPairs`      | number | ✅ 契约      | 累计：被拒的配对请求数（只增不减）                                                                                                                 |
-| `persistence`        | string | ✅ 契约      | 落盘开关：`on` = 配了 `DRC_STATE_FILE`，`off` = 纯内存模式。**刻意不暴露文件路径**（`/healthz` 公网可达，绝对路径对探测者有用、对排障没用）        |
-| `stateRestored`      | number | ✅ 契约      | 启动时从状态文件恢复的会话数（`off` 时恒 0）                                                                                                       |
-| `stateSavedAtSec`    | number | ✅ 契约      | **秒**。距上一次成功写盘多久；`-1` = 本进程还没写过盘                                                                                              |
-| `stateWrites`        | number | ✅ 契约      | 累计：本进程成功写盘次数（只增不减）                                                                                                               |
-| `stateWriteFailures` | number | ✅ 契约      | 累计：本进程写盘失败次数（只增不减，写失败只记日志不致命）                                                                                         |
-| `lastPingAgo`        | number | ✅ 契约      | **秒**。距上一次保活 ping 扫描多久；`-1` = 还没扫过。单位是秒不是毫秒，看指标时别按 ms 判                                                          |
-| `shuttingDown`       | bool   | ✅ 契约      | 收到 SIGTERM/SIGINT 后置位                                                                                                                         |
+| 字段                 | 类型   | 是否运维契约 | 含义                                                                                                                                                                                                |
+| -------------------- | ------ | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ok`                 | bool   | ✅ **契约**  | `!shuttingDown`。停机中变 `false`                                                                                                                                                                   |
+| `version`            | string | ✅ **契约**  | 包版本。**必须是真实版本号，出现 `0.0.0` 说明部署的不是打包产物**（define 没进去）——`tests/bundle.test.mjs` 与 CI `relay-smoke` 都断言它等于包版本                                                  |
+| `uptimeSec`          | number | ✅ 契约      | 进程已运行秒数                                                                                                                                                                                      |
+| `hosts`              | number | ✅ 契约      | 当前在册主机数                                                                                                                                                                                      |
+| `clients`            | number | ✅ 契约      | 当前在册客户端数                                                                                                                                                                                    |
+| `conversations`      | number | ✅ 契约      | 活跃会话（配对通道）数                                                                                                                                                                              |
+| `pendingPairs`       | number | ✅ 契约      | 待配对表条数。**注意**：已用过的码在 TTL 窗口内仍留在表里（为的是给出 `already_used` 而不是 `invalid_or_expired`），所以这个数会短暂高于你的直觉                                                    |
+| `droppedFrames`      | number | ✅ 契约      | 累计：中继**收下但没有收件人**的帧数（会话还在、主机不在或没有观众）。**不含**被拒的路由（`unknown_session`/`not_member` 会回错误给发送方，不是静默丢弃）；慢消费者另有 `slowConsumers`（只增不减） |
+| `slowConsumers`      | number | ✅ 契约      | 累计：被以 1008 `slow_consumer` 断开的对端数（只增不减）                                                                                                                                            |
+| `rejectedPairs`      | number | ✅ 契约      | 累计：被拒的配对请求数（只增不减）                                                                                                                                                                  |
+| `persistence`        | string | ✅ 契约      | 落盘开关：`on` = 配了 `DRC_STATE_FILE`，`off` = 纯内存模式。**刻意不暴露文件路径**（`/healthz` 公网可达，绝对路径对探测者有用、对排障没用）                                                         |
+| `stateRestored`      | number | ✅ 契约      | 启动时从状态文件恢复的会话数（`off` 时恒 0）                                                                                                                                                        |
+| `stateSavedAtSec`    | number | ✅ 契约      | **秒**。距上一次成功写盘多久；`-1` = 本进程还没写过盘                                                                                                                                               |
+| `stateWrites`        | number | ✅ 契约      | 累计：本进程成功写盘次数（只增不减）                                                                                                                                                                |
+| `stateWriteFailures` | number | ✅ 契约      | 累计：本进程写盘失败次数（只增不减，写失败只记日志不致命）                                                                                                                                          |
+| `lastPingAgo`        | number | ✅ 契约      | **秒**。距上一次保活 ping 扫描多久；`-1` = 还没扫过。单位是秒不是毫秒，看指标时别按 ms 判                                                                                                           |
+| `shutdownForced`     | number | ✅ 契约      | 累计：5 秒兜底强退的次数（正常排空恒 0，只增不减）。**兜底与排空成功同为 exit(0)**，退出码分不出这两种停机，这是唯一能事后分辨的出口                                                                |
+| `shuttingDown`       | bool   | ✅ 契约      | 收到 SIGTERM/SIGINT 后置位                                                                                                                                                                          |
 
-这 17 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
-`rejectedPairs`/`stateWrites`/`stateWriteFailures` 是**累计计数**（只增不减），混在一起会让"手机不更新"这类排查分不清
+这 18 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
+`rejectedPairs`/`shutdownForced`/`stateWrites`/`stateWriteFailures` 是**累计计数**（只增不减），混在一起会让"手机不更新"这类排查分不清
 "现在是空的"和"一直送不出去"。 **[已验证：`curl` 实测响应 + 代码 `health()`]**
 
 > 本节此前写作"八个字段"并断言 `lastPingAgo`/`droppedFrames`/`slowConsumers` **不存在**——
@@ -311,31 +315,33 @@ node scripts/loadtest-conns.mjs --n=10000 --seconds=30
 
 ### 5.1 值得盯的行
 
-| `msg`                                                                  | `level`  | 含义 / 该怎么反应                                                                                                                                                      |
-| ---------------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `relay listening`                                                      | info     | 启动成功。`port`/`bind`/`version` 三个字段就是"线上到底是哪版、在听哪个地址"的答案                                                                                     |
-| `host auth failed`                                                     | warn     | 有端点拿错 token 在试。**同一连接连续 5 次会 4001 断开，但断开这一步没有独立的告警行**——只有 `attempts` 一路涨到 5 然后连接消失。看到 `attempts:4` 就该怀疑 token 漂移 |
-| `frame flood disconnected`                                             | warn     | 单连接帧速率违规累计 3 次，已 1008 断开                                                                                                                                |
-| `pair budget exhausted (global)`                                       | warn     | **全局配对配额打满**（`DRC_PAIR_GLOBAL_PER_SEC`）。字段里的 `reason:"rate_limited"` 是我们的真实原因，见 §5.2                                                          |
-| `pair failed`                                                          | **info** | 配对码错。**这一行是 info 级**，字段 `attemptsLeft` 递减到 0 时该连接被 4008 断开——而断开本身没有 warn 行。只盯 `-p warning` 会漏掉配对码爆破                          |
-| `heartbeat timeout`                                                    | warn     | 对端上一轮 WS 层 ping 没回 pong，已 `terminate()`                                                                                                                      |
-| `slow consumer disconnected`                                           | warn     | 缓冲区持续超 `DRC_MAX_BUFFERED_BYTES` 达 10 秒，1008 `slow_consumer` 断开。字段 `buffered` 是当时的字节数                                                              |
-| `pair table full`                                                      | warn     | 待配对表打满（`DRC_MAX_PENDING_PAIRS`）                                                                                                                                |
-| `enc from non-member`                                                  | warn     | 有非会话成员往某条通道灌密文（拒绝）。可能是抢注，也可能是主机重连后的孤儿 socket                                                                                      |
-| `client replaced by newer socket`                                      | warn     | 同 `clientId` 的旧连接被顶掉。同一台手机反复出现说明它在掉线重连                                                                                                       |
-| `socket error` / `send failed`                                         | warn     | 底层 socket 异常，多数是网络抖动，成串出现才值得查                                                                                                                     |
-| `frame handler threw`                                                  | error    | 处理某一帧时抛异常，已回 `error{internal}`。带 `t` 字段，说明是哪类帧                                                                                                  |
-| `uncaught exception` / `unhandled rejection`                           | error    | 进程随即 **exit 1**，交给 `Restart=always` 拉起                                                                                                                        |
-| `shutting down`                                                        | info     | 收到 SIGTERM/SIGINT。`signal` 字段告诉你来源                                                                                                                           |
-| `shutdown timed out, forcing exit`                                     | warn     | 5 秒没排干净，强退（退出码仍是 0）。偶发无妨，频繁出现说明有连接卡在 draining                                                                                          |
-| `host offline (grace started)`                                         | info     | 主机 socket 掉了，宽限期 `DRC_HOST_GRACE_MS` 开始计时。**这条不该当告警用**：主机自己会重连                                                                            |
-| `host grace expired`                                                   | info     | 宽限期到点仍没回来，已向该主机的所有客户端发 `peer-left`。手机上会提示重新配对                                                                                         |
-| `host online` / `client online` / `paired`                             | info     | 正常流水。`paired` 给出 `sessionId`/`hostId`/`clientId` 三元组，是"这台手机连的是这台主机"的唯一权威记录                                                               |
-| `pair token issued`                                                    | info     | 主机发布了一张码，字段 `token:"<redacted>"`。**info 级不落完整配对码**。要看到真正的码得开 `debug`                                                                     |
-| `conversation voided by host` / `conversations dropped at host resync` | info     | 主机自己声明某条会话它不再持有密钥，或 `resync` 时没被列出而被删掉                                                                                                     |
-| `conversation idle-dropped`                                            | info     | 空闲超过 `DRC_CONV_IDLE_TTL_MS` 被回收。客户端下次发帧会撞上 `unknown_session`                                                                                         |
-| `conversation empty-dropped`                                           | info     | 最后一个客户端离开后空过 `DRC_CONV_EMPTY_TTL_MS` 被回收。**socket 断开不起这个表**（护 D3 免扫码），只有 `leave`/重新配对摘清成员才起                                  |
-| `pair tokens expired`                                                  | debug    | 清扫周期清掉的过期/已用码条数                                                                                                                                          |
+| `msg`                                                                    | `level`  | 含义 / 该怎么反应                                                                                                                                                                                              |
+| ------------------------------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `relay listening`                                                        | info     | 启动成功。`port`/`bind`/`version` 三个字段就是"线上到底是哪版、在听哪个地址"的答案                                                                                                                             |
+| `host auth failed`                                                       | warn     | 有端点拿错 token 在试。**同一连接连续 5 次会 4001 断开，但断开这一步没有独立的告警行**——只有 `attempts` 一路涨到 5 然后连接消失。看到 `attempts:4` 就该怀疑 token 漂移                                         |
+| `frame flood disconnected`                                               | warn     | 单连接帧速率违规累计 3 次，已 1008 断开                                                                                                                                                                        |
+| `pair budget exhausted (global)`                                         | warn     | **全局配对配额打满**（`DRC_PAIR_GLOBAL_PER_SEC`）。字段里的 `reason:"rate_limited"` 是我们的真实原因，见 §5.2                                                                                                  |
+| `pair-status budget exhausted`                                           | warn     | `/api/pair-status` 的配额打满（`DRC_PAIR_STATUS_PER_SEC`），该请求已回 **429**。注意到它说明有人在对 6 位码空间做枚举                                                                                          |
+| `http request failed` / `http client error` / `websocket upgrade failed` | warn     | HTTP 面的畸形请求（含畸形 `Host`、坏请求行）。**只记日志、只回 400/500，进程不受影响**——这三条连同固定 URL base 就是本轮修掉的那个未认证 DoS                                                                   |
+| `pair failed`                                                            | **info** | 配对码错。**这一行是 info 级**，字段 `attemptsLeft` 递减到 0 时该连接被 4008 断开——而断开本身没有 warn 行。只盯 `-p warning` 会漏掉配对码爆破                                                                  |
+| `heartbeat timeout`                                                      | warn     | 对端上一轮 WS 层 ping 没回 pong，已 `terminate()`                                                                                                                                                              |
+| `slow consumer disconnected`                                             | warn     | 缓冲区**连续**超 `DRC_MAX_BUFFERED_BYTES` 达**本角色的窗口**（主机 `DRC_SLOW_CONSUMER_HOST_MS` 10 秒 / 客户端 `DRC_SLOW_CONSUMER_CLIENT_MS` 45 秒），1008 `slow_consumer` 断开。字段 `buffered` 是当时的字节数 |
+| `pair table full`                                                        | warn     | 待配对表打满（`DRC_MAX_PENDING_PAIRS`）                                                                                                                                                                        |
+| `enc from non-member`                                                    | warn     | 有非会话成员往某条通道灌密文（拒绝）。可能是抢注，也可能是主机重连后的孤儿 socket                                                                                                                              |
+| `client replaced by newer socket`                                        | warn     | 同 `clientId` 的旧连接被顶掉。同一台手机反复出现说明它在掉线重连                                                                                                                                               |
+| `socket error` / `send failed`                                           | warn     | 底层 socket 异常，多数是网络抖动，成串出现才值得查                                                                                                                                                             |
+| `frame handler threw`                                                    | error    | 处理某一帧时抛异常，已回 `error{internal}`。带 `t` 字段，说明是哪类帧                                                                                                                                          |
+| `uncaught exception` / `unhandled rejection`                             | error    | 进程随即 **exit 1**，交给 `Restart=always` 拉起                                                                                                                                                                |
+| `shutting down`                                                          | info     | 收到 SIGTERM/SIGINT。`signal` 字段告诉你来源                                                                                                                                                                   |
+| `shutdown timed out, forcing exit`                                       | warn     | 5 秒没排干净，强退（退出码仍是 0）。偶发无妨，频繁出现说明有连接卡在 draining。紧跟着的 `shutdown forced` 会补写一次状态文件，并把这次强退记进 `/healthz` 的 `shutdownForced`                                  |
+| `host offline (grace started)`                                           | info     | 主机 socket 掉了，宽限期 `DRC_HOST_GRACE_MS` 开始计时。**这条不该当告警用**：主机自己会重连                                                                                                                    |
+| `host grace expired`                                                     | info     | 宽限期到点仍没回来，已向该主机的所有客户端发 `peer-left`。手机上会提示重新配对                                                                                                                                 |
+| `host online` / `client online` / `paired`                               | info     | 正常流水。`paired` 给出 `sessionId`/`hostId`/`clientId` 三元组，是"这台手机连的是这台主机"的唯一权威记录                                                                                                       |
+| `pair token issued`                                                      | info     | 主机发布了一张码，字段 `token:"<redacted>"`。**info 级不落完整配对码**。要看到真正的码得开 `debug`                                                                                                             |
+| `conversation voided by host` / `conversations dropped at host resync`   | info     | 主机自己声明某条会话它不再持有密钥，或 `resync` 时没被列出而被删掉                                                                                                                                             |
+| `conversation idle-dropped`                                              | info     | 空闲超过 `DRC_CONV_IDLE_TTL_MS` 被回收。客户端下次发帧会撞上 `unknown_session`                                                                                                                                 |
+| `conversation empty-dropped`                                             | info     | 最后一个客户端离开后空过 `DRC_CONV_EMPTY_TTL_MS` 被回收。**socket 断开不起这个表**（护 D3 免扫码），只有 `leave`/重新配对摘清成员才起                                                                          |
+| `pair tokens expired`                                                    | debug    | 清扫周期清掉的过期/已用码条数                                                                                                                                                                                  |
 
 ### 5.2 限速时"线上说法"与"日志说法"不一致（必须知道）
 
@@ -413,12 +419,22 @@ PSK 与配对关系落盘只会扩大泄露面。**例外**：配了 `DRC_STATE_
 - **同 `hostId` 重连会顶掉旧连接**：旧 socket 收到自定义关闭码 **4000 `replaced_by_newer_socket`**。
   主机的重连策略靠它区分"我被更新的一个实例顶了"——如果日志里反复出现
   `host online {replaced:1}`，说明有两份主机在抢同一个 `hostId`。
-- **主机重连后已有会话会挂回新 socket**：注册成功时中继会把该主机名下的会话作为
-  `peer-joined` 重放给已连接的客户端，让客户端知道原来的 `convId` 还能继续用。
-- **每个清扫周期（`DRC_SWEEP_MS`）做五件事**：清过期/已用的配对码 → 给所有 socket 发 WS 层
-  ping 并把上一轮没回 pong 的连接 `terminate()`（默认最坏约 2×5 秒判死）→ 判 host 宽限期是否到期
-  → 回收空闲超过 `DRC_CONV_IDLE_TTL_MS` 的会话 → 回收**最后一个客户端离开后**空过
-  `DRC_CONV_EMPTY_TTL_MS` 的空会话（`msg:"conversation empty-dropped"`）。保活**只走 WS 层 ping**。
+- **主机重连后不会向客户端重放 `peer-joined`**（2026-10-06 删掉了那条重放）：随仓发布的
+  mp 客户端 `_onFrame` 里**没有** `peer-joined` 分支（落 `default` 静默忽略），而且那条帧
+  当时还把 `hostId` 塞进了 `clientId` 字段。客户端续用旧 `convId` 真正靠的是
+  `hello-ok` → `cmd.list_sessions`，与"主机这条 socket 什么时候回来"无关。
+- **每个清扫周期（`DRC_SWEEP_MS`）做五件事**：清过期/已用的配对码 → **慢消费者判定**
+  （对每个 `OPEN` 连接读 `bufferedAmount`，连续超限达本角色窗口就 1008 断开——它是**定时
+  驱动**的，静默的对端同样会被评估）→ 判 host 宽限期是否到期 → 回收空闲超过
+  `DRC_CONV_IDLE_TTL_MS` 的会话 → 回收**最后一个客户端离开后**空过
+  `DRC_CONV_EMPTY_TTL_MS` 的空会话（`msg:"conversation empty-dropped"`）。
+- **保活 ping 不挂在清扫上**：它是独立定时器（步长 `DRC_PING_TICK_MS`，默认 1 秒一轮），
+  每轮只 ping 一个桶，桶数 = `DRC_PING_INTERVAL_MS / DRC_PING_TICK_MS`（默认 60 桶），
+  于是一条连接两次被 ping 的间隔稳定等于 `DRC_PING_INTERVAL_MS`（默认 60 秒）。
+  `alive` 是"上一轮有没有回 pong"的单轮标志，所以半开对端（没有 FIN/RST）要轮到**两次**
+  才被发现：最坏判死 ≈ **2×`DRC_PING_INTERVAL_MS`**（默认约 121 秒，**不是** 2×`DRC_SWEEP_MS`）。
+  真机上的常规断开走 `close`/`error` 事件，不受这个时间影响；在意槽位回收速度就调小
+  `DRC_PING_INTERVAL_MS`。保活**只走 WS 层 ping**（主机与小程序都不发应用层心跳）。
 - **每 `DRC_COUNTERS_LOG_MS` 抄一次计数器进日志**（`msg:"counters"`，字段与 `/healthz` 同源，
   由同一个 `health()` 产出）。为什么要有这一条：`droppedFrames` / `slowConsumers` /
   `rejectedPairs` 是**自启动累计**，`/healthz` 只在当前进程里有值，重启即归零；而中继

@@ -32,6 +32,25 @@ export interface LogRecord {
 /** 需要占位的敏感字段一律用它，别把值传进日志调用。 */
 export const REDACTED = '<redacted>'
 
+/**
+ * 日志里单个字符串值（含 `msg`）的最长字符数。超出就截断并加 `…` 标记。
+ *
+ * 为什么**每个**字符串值都必须过这一道（2026-10-06 实测）：出站日志进的是
+ * systemd-journald，而它按**条数**限流、不按字节。于是"对端自报的字段"是一条
+ * 免费的日志放大器——实测 20 帧带 400 KiB `clientMeta.platform` 的 `hello`
+ * 就写出 8.19 MB 日志 / 1.2s，单行 409 KB；一条 409 KB 的行和一条 40 字节的行
+ * 占的是同一个 journald 配额，磁盘与限流窗口一起被吃掉。
+ *
+ * 256 是"够排障、不够灌水"的折中：日志里合法出现的就只有 id / 计数 / 配对码占位 /
+ * 角色名，它们全都远短于这个数；协议侧再补 `clientMeta` 的 max(128) 之后，
+ * 这里只作为**结构性**上限兜住"未来某个新字段又没设上限"。
+ */
+export const MAX_LOG_VALUE_CHARS = 256
+
+function clampText(value: string): string {
+  return value.length <= MAX_LOG_VALUE_CHARS ? value : `${value.slice(0, MAX_LOG_VALUE_CHARS)}…`
+}
+
 export class Log {
   private readonly threshold: number
 
@@ -44,10 +63,13 @@ export class Log {
 
   log(level: LogLevel, msg: string, fields: LogFields = {}): void {
     if (levelWeight(level) < this.threshold) return
-    const record: LogRecord = { ts: new Date().toISOString(), level, msg }
+    // 值一律过 clampText（上限见 MAX_LOG_VALUE_CHARS）。脱敏仍然是**调用方**的纪律
+    // （`REDACTED` 占位、info 级不打配对码）——截断只治"长度"，不替脱敏负责，
+    // 两条纪律各管各的，谁都不能因此省掉。
+    const record: LogRecord = { ts: new Date().toISOString(), level, msg: clampText(msg) }
     for (const [key, value] of Object.entries(fields)) {
       if (value === undefined) continue
-      record[key] = value
+      record[key] = typeof value === 'string' ? clampText(value) : value
     }
     this.write(JSON.stringify(record))
   }

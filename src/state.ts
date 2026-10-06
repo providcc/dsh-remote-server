@@ -1,9 +1,14 @@
 /**
  * state — 中继的全部可变状态。
  *
- * 四张表是这套系统唯一的"事实"，而且**全在内存**：不持久化是有意设计
- * （取证 `docs/legacy-spec/relay-and-wireformat.md` §2.1 第 5 点与 HANDOFF §6——
- * PSK 与配对关系落盘只会扩大泄露面）。
+ * 四张表是这套系统唯一的"事实"，**默认全在内存**。1.0.6 起多了一条例外：
+ * `DRC_STATE_FILE` 打开时 `conversations` 会落盘（`persist.ts`，默认关闭，落的是
+ * conversationId / hostId / clients / seqHost / lastActivityAt / emptySince）。
+ * 另外三张（`hosts` / `clients` / `pendingPairs`）**永远只在内存里**，这不是疏漏：
+ * 它们是活连接与短命状态（配对码 TTL 120 s 且一次性），落盘只会造出"幽灵对端"。
+ * 落盘也不扩大泄露面——中继从来不持有 PSK（D1），会话 id 与 client id 本来就明文
+ * 出现在每一帧里（取证 `docs/legacy-spec/relay-and-wireformat.md` §2.1 第 5 点、
+ * HANDOFF §6 与 §1.1 方案 A）。
  *
  * 这里守住四条不变量，每条都有对应测试：
  *
@@ -220,6 +225,7 @@ export class RelayState implements Clock {
   resync(hostId: string, sessionIds: readonly string[]): { kept: number; dropped: string[] } {
     const claimed = new Set(sessionIds)
     const dropped: string[] = []
+    let kept = 0
     for (const [conversationId, conv] of [...this.conversations]) {
       if (conv.hostId !== hostId) continue
       if (claimed.has(conversationId)) {
@@ -228,12 +234,17 @@ export class RelayState implements Clock {
         // 主机重启后重新声明的会话：成员表它自己的重连会补上，此刻仍是空的就**从这一刻**
         // 起算空会话回收——否则一条重启前就被掏空的会话会因为没人打点而挂到 7 天。
         this.markEmpty(conv, this.now())
+        kept += 1
         continue
       }
       this.conversations.delete(conversationId)
       dropped.push(conversationId)
     }
-    return { kept: claimed.size - dropped.length, dropped }
+    // `kept` 数的是**真的被留下的**条数，不是声明里的 id 数：主机可能列上一条
+    // 属于别的主机（或早已不存在）的 convId，旧写法 `claimed.size - dropped.length`
+    // 会把它们一起算进去，日志里的 kept 于是比实际大——而这条日志正是运维判断
+    // "主机还记得几条会话"的唯一出口。
+    return { kept, dropped }
   }
 
   /** host→client 方向由中继编号；客户端从不读它（F13）。 */

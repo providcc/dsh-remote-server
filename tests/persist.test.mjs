@@ -7,7 +7,17 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
@@ -411,6 +421,36 @@ test('验收 5b：空会话回收同样同步删盘（走清扫那条路）', as
 })
 
 // ── 单测：写盘与恢复的边界 ─────────────────────────────────────────────
+
+test('临时文件残留 / pid 复用：最终状态文件仍是 0600（mode 只在创建那一刻生效）', () => {
+  const dir = tmpDir()
+  try {
+    const p = join(dir, 'state.json')
+    const tmp = `${p}.${process.pid}.tmp`
+    // 伪造一份"上次崩溃留下的"临时文件：0644、内容是旧快照。
+    // 临时名是固定的 `${path}.${pid}.tmp`，崩溃残留 + 那次崩溃的 pid 被系统复用，
+    // 就会让 writeFileSync 写在一份已存在的 0644 文件上——mode 选项对已存在的文件
+    // 不生效，rename 之后最终状态文件也就成了 0644（P2）。
+    writeFileSync(tmp, '{"version":1,"savedAt":0,"conversations":[]}\n')
+    chmodSync(tmp, 0o644)
+    assert.equal(statSync(tmp).mode & 0o777, 0o644, '前置条件：残留临时文件确实是 0644')
+
+    const { log } = captureLog()
+    const state = new RelayState()
+    state.conversations.set('c_aaaaaaaaaaaa', {
+      hostId: 'h1',
+      clients: new Set(['inst-1']),
+      seqHost: 3,
+      lastActivityAt: 1234,
+    })
+    assert.equal(writeStateFile(p, snapshotState(state, 999), log), true)
+    assert.equal(statSync(p).mode & 0o777, 0o600, '最终状态文件沿用了残留临时文件的权限')
+    assert.deepEqual(readdirSync(dir), ['state.json'], '临时文件不许留在盘上过夜')
+    assert.equal(JSON.parse(readFileSync(p, 'utf8')).savedAt, 999, '内容必须是这一次的新快照')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('原子写：不留临时文件，落盘内容可完整读回', () => {
   const dir = tmpDir()

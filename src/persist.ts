@@ -38,7 +38,7 @@
  *
  * 本文件不 import `ws`、不 import `server.ts`，可以纯内存单测。
  */
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { CONVERSATION_ID_PREFIX } from 'dsh-remote-wire/ids'
 import type { Log } from './log.js'
@@ -239,7 +239,19 @@ export function writeStateFile(path: string, snapshot: PersistedState, log: Log)
   const tmp = `${path}.${process.pid}.tmp`
   try {
     mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(tmp, `${JSON.stringify(snapshot)}\n`, { encoding: 'utf8', mode: 0o600 })
+    // **独占创建**（'wx'）+ 显式 chmod，两件都不能省（P2）：
+    // 临时名是固定的 `${path}.${pid}.tmp`，`mode: 0o600` 只在**创建**那一刻生效——
+    // 崩溃残留、或那次崩溃的 pid 被系统复用，就会 `writeFileSync` 到一份已存在的
+    // 0644 文件上（沿用它的权限），rename 之后最终状态文件也就成了 0644。
+    // 先 unlink 掉残留，再以 'wx' 独占创建，最后**显式** chmodSync 0600：
+    // 权限从此不取决于"这个 tmp 路径上一次是谁留下的、umask 是多少"。
+    try {
+      unlinkSync(tmp)
+    } catch {
+      /* ENOENT 就是我们要的：没有残留 */
+    }
+    writeFileSync(tmp, `${JSON.stringify(snapshot)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    chmodSync(tmp, 0o600)
     renameSync(tmp, path)
     return true
   } catch (e) {

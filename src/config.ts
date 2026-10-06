@@ -39,6 +39,14 @@ export interface RelayConfig {
   maxHostAuthAttempts: number
   maxPairAttemptsPerConn: number
   pairGlobalBudgetPerSec: number
+  /**
+   * `/api/pair-status` 的每秒配额（只在该接口显式开启时生效）。
+   *
+   * 为什么单独一条：它是**唯一一条无认证的 HTTP 判定接口**，答的是"这个 6 位码在不在"，
+   * 而 6 位码只有 10^6 空间——不设配额就是一台免费的枚举机。默认 5/s（比配对帧的
+   * 20/s 更紧），用尽回 429 并记 warn。真正的边界仍应由反代限流兜住。
+   */
+  pairStatusBudgetPerSec: number
   maxPendingPairs: number
   conversationIdleTtlMs: number
   /** 空会话（成员表一个客户端都不剩）回收时限：最后一个客户端离开起算。 */
@@ -164,6 +172,7 @@ export function loadConfig(
     maxHostAuthAttempts: integer(env.DRC_HOST_AUTH_MAX_ATTEMPTS, 5, 'DRC_HOST_AUTH_MAX_ATTEMPTS'),
     maxPairAttemptsPerConn: integer(env.DRC_PAIR_ATTEMPTS_PER_CONN, 5, 'DRC_PAIR_ATTEMPTS_PER_CONN'),
     pairGlobalBudgetPerSec: integer(env.DRC_PAIR_GLOBAL_PER_SEC, 20, 'DRC_PAIR_GLOBAL_PER_SEC'),
+    pairStatusBudgetPerSec: integer(env.DRC_PAIR_STATUS_PER_SEC, 5, 'DRC_PAIR_STATUS_PER_SEC'),
     maxPendingPairs: integer(env.DRC_MAX_PENDING_PAIRS, 1000, 'DRC_MAX_PENDING_PAIRS'),
     conversationIdleTtlMs: integer(env.DRC_CONV_IDLE_TTL_MS, 7 * 24 * 3600 * 1000, 'DRC_CONV_IDLE_TTL_MS'),
     // P2-⑤（2026-10-04 用户拍板 30 分钟）：远小于 7 天的空闲 TTL。

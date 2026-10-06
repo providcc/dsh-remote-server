@@ -10,6 +10,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import net from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
 
@@ -232,29 +233,136 @@ test('主机鉴权爆破：用尽 4001 断开', async () => {
   }
 })
 
-test('连接数上限：超出后新连接立刻 1013，已建立的会话不受影响', async () => {
+test('连接数上限：第 maxConnections 条仍被接受，第 maxConnections+1 条才 1013（off-by-one）', async () => {
+  // 旧写法 `wss.clients.size + 1 > max` 把**新连接算了两次**（ws 在回调前就已经
+  // clients.add），于是 DRC_MAX_CONNS=3 实际只收 2 条——只断言"至少一个被拒"
+  // 的测试永远发现不了它。这条钉死精确边界。
   const server = await boot({ DRC_MAX_CONNS: '3' })
   try {
-    const kept = connect(server.url)
-    await kept.opened
-    kept.send({ t: 'hello', role: 'client', clientId: 'kept' })
-    await waitFrames(kept, 1)
-    const extras = []
+    const kept = []
     for (let i = 0; i < 3; i++) {
-      const extra = connect(server.url)
-      extras.push(extra)
-      await extra.opened.catch(() => {})
+      const peer = connect(server.url)
+      await peer.opened
+      peer.send({ t: 'hello', role: 'client', clientId: `cap-${i}` })
+      await waitFrames(peer, 1)
+      kept.push(peer)
     }
-    let sawBusy = false
-    for (const extra of extras) {
-      const verdict = await Promise.race([extra.closed, sleep(1200).then(() => null)])
-      if (verdict && verdict.code === 1013) sawBusy = true
+    for (const [i, peer] of kept.entries()) {
+      assert.equal(peer.frames[0]?.t, 'hello-ok', `第 ${i + 1} 条连接被拒了：上限被 off-by-one 少算了一条`)
     }
-    assert.ok(sawBusy, '至少要有一个超额连接被 1013 拒绝')
-    // 先建立的那条必须还在（拒绝新连接不该顺手拆掉旧连接）
-    kept.send({ t: 'ping', ts: 1 })
-    const frames = await waitFrames(kept, 2)
-    assert.ok(frames.some((f) => f.t === 'pong'))
+
+    const extra = connect(server.url)
+    await extra.opened.catch(() => {})
+    const verdict = await Promise.race([extra.closed, sleep(1500).then(() => null)])
+    assert.ok(verdict, '第 maxConnections+1 条必须被拒')
+    assert.equal(verdict.code, 1013)
+
+    // 先建立的三条必须都还在（拒绝新连接不该顺手拆掉旧连接）。
+    for (const peer of kept) {
+      peer.send({ t: 'ping', ts: 1 })
+      const frames = await waitFrames(peer, 2)
+      assert.ok(frames.some((f) => f.t === 'pong'))
+    }
+    assert.equal((await (await fetch(`http://127.0.0.1:${server.port}/healthz`)).json()).clients, 3)
+  } finally {
+    await server.kill()
+  }
+})
+
+/**
+ * 发一条**原样**的 HTTP 请求（不走 fetch：Host 头是 fetch 不让我们随便写的），
+ * 返回服务端回的全部字节。socket 关掉/超时都算结束——判据是"进程还活着"，
+ * 不是"回了什么"。
+ */
+function rawHttp(port, request, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const chunks = []
+    const socket = net.connect(port, '127.0.0.1')
+    const done = () => {
+      socket.destroy()
+      resolve(Buffer.concat(chunks).toString('utf8'))
+    }
+    socket.on('error', done)
+    socket.on('close', done)
+    socket.setTimeout(timeoutMs, done)
+    socket.on('connect', () => socket.write(request))
+    socket.on('data', (chunk) => chunks.push(chunk))
+  })
+}
+
+/**
+ * P0-1：一个未认证的畸形 `Host` 头就能让中继 exit 1（远程 DoS）。
+ *
+ * 实测（修复前）：`GET /healthz` + `Host: [` → 无响应、进程 exit 1、日志
+ * `uncaught exception: Invalid URL`；`Host: x:99999`、absolute-form 同样崩。
+ * 根因是 request listener 里同步抛的 `new URL(req.url, \`http://${req.headers.host}\`)`
+ * ——Node 不兜底，异常冒到 main.ts 的 uncaughtException 分支 exit(1)。
+ *
+ * 修复后：URL 的 base 固定（不用客户端 Host）、整段 try/catch、clientError 兜底。
+ * 判据就是"进程仍活着，且后续 /healthz 仍 200"。
+ */
+test('畸形 Host 头不许打挂进程（P0-1）：[ / x:99999 / absolute-form 之后仍能服务', async () => {
+  const server = await boot()
+  try {
+    for (const raw of [
+      'GET /healthz HTTP/1.1\r\nHost: [\r\nConnection: close\r\n\r\n',
+      'GET /healthz HTTP/1.1\r\nHost: x:99999\r\nConnection: close\r\n\r\n',
+      'GET http://[/healthz HTTP/1.1\r\nHost: [\r\nConnection: close\r\n\r\n',
+      'GET /healthz HTTP/1.1\r\nHost: ]:not a host\r\nConnection: close\r\n\r\n',
+    ]) {
+      const reply = await rawHttp(server.port, raw)
+      assert.ok(reply.length > 0, `畸形请求一个字节都没回：${JSON.stringify(raw)}`)
+      assert.equal(server.child.exitCode, null, `畸形 Host 把中继打挂了：${JSON.stringify(raw)}`)
+    }
+    await sleep(100)
+    assert.equal(server.child.exitCode, null, '中继进程已经不在了（uncaught exception → exit 1）')
+    const health = await fetch(`http://127.0.0.1:${server.port}/healthz`).then((r) => r.json())
+    assert.equal(health.ok, true, '挨了一串畸形请求之后 /healthz 必须照常 200')
+    assert.ok(!/uncaught exception/.test(server.text()), '日志里出现了 uncaught exception：异常冒到进程了')
+  } finally {
+    await server.kill()
+  }
+})
+
+test('超长自报字段不许放大日志：单行有界（P1-3）', async () => {
+  const server = await boot({ DRC_LOG_LEVEL: 'info' })
+  try {
+    const peer = connect(server.url)
+    await peer.opened
+    // 400 KiB 的 clientMeta.platform：协议侧上限由 Lead 补（max 128），
+    // 中继这一侧必须自己扛住——journald 按**条数**限流，不按字节，
+    // 一条 409 KB 的行和一条 40 字节的行占同一个配额。
+    peer.send({
+      t: 'hello',
+      role: 'client',
+      clientId: 'big-meta',
+      clientMeta: { platform: 'x'.repeat(400 * 1024) },
+    })
+    await waitFrames(peer, 1)
+    await sleep(150)
+    const longest = server.lines.reduce((max, line) => Math.max(max, Buffer.byteLength(line)), 0)
+    assert.ok(longest <= 1024, `单行日志 ${longest} 字节：对端自报字段把日志放大了`)
+    assert.ok(
+      server.lines.some((line) => line.includes('client online')),
+      '截断不许把整条日志吞掉：client online 仍要留下',
+    )
+    assert.equal(server.child.exitCode, null)
+  } finally {
+    await server.kill()
+  }
+})
+
+test('P2：/api/pair-status 开启后有限流（无认证的 10^6 空间判定 oracle）', async () => {
+  const server = await boot({ DRC_PAIR_STATUS: '1', DRC_PAIR_STATUS_PER_SEC: '2' })
+  try {
+    const statuses = []
+    for (let i = 0; i < 6; i++) {
+      statuses.push((await fetch(`http://127.0.0.1:${server.port}/api/pair-status?token=12345${i}`)).status)
+    }
+    assert.equal(statuses[0], 200, '配额内的请求必须照常应答')
+    assert.ok(statuses.includes(429), `超配额的请求必须被拒（实际状态码：${statuses.join(',')}）`)
+    assert.match(server.text(), /pair-status budget exhausted/, '限流必须留痕：否则线上只看到一批"码不存在"')
+    assert.match(server.text(), /rate_limited/, '日志里要写清真正的原因是 rate_limited')
   } finally {
     await server.kill()
   }
@@ -370,8 +478,9 @@ test('同一 hostId 顶号：旧 socket 收到 4000，会话与已配对的客�
     await waitFrames(hostB, 1)
     // 顶号之后下行必须能从新 socket 走（旧 socket 的 close 不许把会话删掉）。
     hostB.send({ t: 'enc', sessionId: paired.sessionId, ciphertext: 'AAECAwQFBgcICQoLDA0ODw==' })
-    // 等"这一帧"，不等"第 N 帧"：重连时中继还会推一条 peer-joined 通知，
-    // 用帧数当等待条件会被它抢先满足（上一版测试就是这么假红的）。
+    // 等"这一帧"，不等"第 N 帧"：帧数会随中继"顺手还推了什么"浮动，用帧数当等待条件
+    // 会假红（上一版测试就是这么假红的）。2026-10-06 起主机重连不再向客户端重放
+    // peer-joined（mp 客户端没有那条分支），等待写法不变，判据仍落在"这一帧到了没有"。
     const down = await waitFor(client, (f) => f.t === 'enc' && f.sessionId === paired.sessionId)
     assert.equal(down.ciphertext, 'AAECAwQFBgcICQoLDA0ODw==')
   } finally {

@@ -5,6 +5,53 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [Unreleased]
+
+rc1 前的缺陷修复（逐行审计的发现，每条都有判据钉住）。
+
+### 修复
+
+- **未认证的畸形 `Host` 头可让中继进程 exit 1（远程 DoS）**。`new URL(req.url,
+  "http://" + req.headers.host)` 在 request listener 里同步抛 TypeError，Node 不兜底 →
+  `uncaughtException` → exit 1；实测 `GET /healthz` 配 `Host: [` 即复现，`Host: x:99999`
+  与 absolute-form 同样崩。修法：URL 的 base 固定为 `http://relay.invalid`（不用客户端
+  Host）、整个 HTTP 面 try/catch（异常只回 500）、补 `clientError`/upgrade 兜底。
+- **同一条 socket 反复 `hello` 换身份时旧键永不释放**：`attachClient` 每次 set 新键，
+  而 `close` 只按最后一次的 `clientId` 调 `clientGone`——未认证的对端在一条连接上连发
+  N 个不同 clientId 就能让 `state.clients` 无界增长，`/healthz clients` 永久虚高
+  （实测 3000 个 id → `clients:499`，关掉 socket 后仍是 499）。修法：二次 `hello`
+  且身份不同就先走 `clientGone`/`hostGone` 释放旧键；`attachHost` 同形问题一并修。
+- **日志值没有长度上限**：20 帧带 400 KiB `clientMeta.platform` 的 `hello` 写出
+  8.19 MB 日志、单行 409 KB，而 journald 按条数限流不按字节。修法：`Log.log` 对
+  所有字符串值（含 `msg`）统一截断到 256 字符并加 `…`；脱敏纪律不变。
+- **停机只写一次盘，且写早了**：最后一次 `persistNow()` 在关 socket 之前，之后的变更
+  （`clientGone` 更新 `lastActivityAt` 等）不落盘。修法：排空结束后再写一次；5 秒兜底
+  路径也补写，并把 `shutdownForced` 记进 `/healthz`（兜底与排空成功同为 exit 0）。
+- **`/api/pair-status` 无限流**（`DRC_PAIR_STATUS=1` 时）：一条无认证、回答"这个 6 位码
+  在不在"的接口，10⁶ 空间等于免费枚举机。修法：新增 `DRC_PAIR_STATUS_PER_SEC`（默认
+  5/s），超配额回 429 并记 warn。
+- **连接数上限 off-by-one**：`wss.clients.size + 1 > max` 把新连接算两次（ws 在回调前
+  已 `clients.add`），`DRC_MAX_CONNS=3` 实际只收 2 条。修法：去掉 `+1`。
+- **帧名认识但形状不合法时错报 `unknown_frame`**（与注释承诺相反，排障时会误判成
+  "对端版本不对"）。修法：未知帧名 → `unknown_frame`，已知帧名但形状坏 → `bad_frame`。
+- **`enc-batch` 上行在主机缺席时静默丢弃还续命**（与单帧路径不对称）。修法：与 `enc`
+  对齐——回 `host_unavailable`，不 `touchConversation`。
+- **`resync` 的 `kept` 算错**（`claimed.size - dropped.length` 会把不属于该主机、
+  甚至不存在的 id 也算进去）。修法：按实际保留的会话计数。
+- **落盘临时文件权限可被残留/pid 复用带偏**：`mode: 0o600` 只在创建时生效，而 tmp 名
+  固定为 `${path}.${pid}.tmp`。修法：`flag: 'wx'` 独占创建 + 显式 `chmodSync` 0600。
+
+### 变更
+
+- **主机重连不再向客户端重放 `peer-joined`**：随仓发布的 mp 客户端 `_onFrame` 里没有
+  这条分支（落 default 静默忽略），且字段把 `hostId` 塞进了 `clientId`。客户端续用旧
+  `convId` 靠的是 `hello-ok` → `cmd.list_sessions`。
+- `/healthz` 新增 `shutdownForced`（累计强退次数）；配置新增 `DRC_PAIR_STATUS_PER_SEC`。
+- `scripts/relay-start.sh` 默认日志级别从 `debug` 改为 `info`（debug 会打印完整配对码），
+  并给短于 4 字符的 token 加长度守卫（原写法会把整个值打出来）。
+- `scripts/loadtest-conns.mjs` 补 try/finally 收尾（抛错时回收子中继与日志流），
+  `ROOT` 改用 `fileURLToPath`。
+
 ## [1.0.6] - 2026-10-06
 
 ### 新增

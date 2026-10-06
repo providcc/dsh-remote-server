@@ -49,6 +49,32 @@ import { RelayState, WS_OPEN, type Sock } from './state.js'
 /** 保留的自定义关闭码：同 hostId 顶号。客户端的重连策略不认识它，只对主机有意义。 */
 const CLOSE_REPLACED = 4000
 
+/**
+ * 协议里"存在"的全部帧名（wire 的 F1 冻结表 + `resync`/`session-leave` 两条后加的）。
+ *
+ * 只用于一处：把"帧名根本不认识"（对端版本不对 → unknown_frame）与"名字认识但形状
+ * 不合法"（对端发了坏数据 → bad_frame）分开。列表类型上有约束——只能写进
+ * `EndpointFrame` / `RelayFrame` 两个 union 里真实存在的 `t`，写错一个字母就编译不过。
+ */
+const KNOWN_FRAME_NAMES: ReadonlySet<string> = new Set<EndpointFrame['t'] | RelayFrame['t']>([
+  'hello',
+  'pair-begin',
+  'pair-begin-client',
+  'resync',
+  'enc',
+  'enc-batch',
+  'session-leave',
+  'ping',
+  'hello-ok',
+  'pair-ready',
+  'paired',
+  'pair-fail',
+  'peer-joined',
+  'peer-left',
+  'error',
+  'pong',
+])
+
 interface Peer {
   ws: WebSocket
   role: 'unknown' | 'host' | 'client'
@@ -76,6 +102,8 @@ export interface RelayHandle {
   health(): Record<string, string | number | boolean>
   /** 优雅停机：向所有对端发 1001，等在途连接结束。 */
   close(): Promise<void>
+  /** 排空超时后的兜底停机：补写一次盘并把这次"没排空"记进 /healthz。 */
+  forceShutdown(): void
   startListening(): Promise<{ port: number; bind: string }>
 }
 
@@ -92,6 +120,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
   const state = new RelayState({ maxPendingPairs: config.maxPendingPairs })
   const startedAt = Date.now()
   const pairBudget = new Budget(config.pairGlobalBudgetPerSec)
+  /** `/api/pair-status` 的独立配额：它走 HTTP、无认证，和配对帧不是同一条入口。 */
+  const pairStatusBudget = new Budget(config.pairStatusBudgetPerSec)
   const peers = new WeakMap<WebSocket, Peer>()
   let shuttingDown = false
   let sweepTimer: NodeJS.Timeout | undefined
@@ -180,8 +210,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
    *   注意它不含路由被拒（`unknown_session`/`not_member`）——那些会回错误给发送方，不静默。
    * - `slowConsumers`：因发送缓冲超限被 1008 断开的对端。
    * - `rejectedPairs`：中继回过 `pair-fail` 的配对尝试次数（码错/过期/已用过/额度耗尽）。
+   * - `shutdownForced`：5 秒兜底强退的次数（正常排空为 0）。兜底与排空成功同码 exit(0)，
+   *   退出码分不出这两种停机，这是运维事后唯一能分辨的出口。
    */
-  const counters = { droppedFrames: 0, slowConsumers: 0, rejectedPairs: 0 }
+  const counters = { droppedFrames: 0, slowConsumers: 0, rejectedPairs: 0, shutdownForced: 0 }
 
   // ── 发送 ────────────────────────────────────────────────────────────
 
@@ -250,6 +282,39 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   // ── 控制面 ──────────────────────────────────────────────────────────
 
+  /**
+   * 同一 socket 二次 `hello` 且身份变了：先把上一次登记的键释放掉（P1-2）。
+   *
+   * 不释放的后果（2026-10-06 实测）：`attachClient` 每次 `set` 一个新键，而 `close`
+   * 只按 `peer.clientId`（最后一次的值）调 `clientGone`——旧键**永远**留在
+   * `state.clients` 里。于是**未认证**的对端只要在一条连接上连发 N 个不同 clientId 的
+   * `hello`，就能让这张 Map 无界增长；`/healthz` 的 `clients` 也永久虚高
+   * （实测：单连接 3000 个 clientId → clients:499，socket 关掉后仍是 499）。
+   * `attachHost` 形状相同，只是它需要 token（把同样的泄漏留给了一条已认证的连接）。
+   *
+   * 释放走的就是正常离场的那两条路（`clientGone` / `hostGone`），语义完全一致：
+   * 客户端换 id 要向它所在会话的主机发 `peer-left`；主机换 id 会给自己名下的会话
+   * 打上宽限期计时——因为这条 socket 确实不再服务于旧身份了。
+   */
+  function releaseIdentityFor(peer: Peer, next: { role: 'host' | 'client'; id: string }): void {
+    const sameIdentity =
+      peer.role === next.role && (next.role === 'client' ? peer.clientId === next.id : peer.hostId === next.id)
+    if (sameIdentity) return
+    if (peer.role === 'client' && peer.clientId) {
+      const old = peer.clientId
+      for (const notice of state.clientGone(old, peer.ws)) {
+        sendTo(state.hostSocket(notice.conversationId), peerLeftFrame(notice.conversationId, notice.clientId))
+      }
+      log.info('client identity released by re-hello', { clientId: old })
+    }
+    if (peer.role === 'host' && peer.hostId) {
+      if (state.hostGone(peer.hostId, peer.ws)) log.info('host identity released by re-hello', { hostId: peer.hostId })
+    }
+    peer.role = 'unknown'
+    peer.clientId = undefined
+    peer.hostId = undefined
+  }
+
   function handleHello(peer: Peer, frame: Extract<EndpointFrame, { t: 'hello' }>): void {
     if (frame.role === 'host') {
       if (!config.hostToken) {
@@ -266,19 +331,20 @@ export function createRelay(config: RelayConfig): RelayHandle {
         return
       }
       const hostId = frame.hostId?.trim() || newHostId()
+      releaseIdentityFor(peer, { role: 'host', id: hostId })
       const { replaced } = state.attachHost(hostId, peer.ws, frame.label ?? '')
       peer.role = 'host'
       peer.hostId = hostId
       sendToPeer(peer, helloOkForHost(hostId, frame.protocol))
       log.info('host online', { hostId, label: frame.label ?? '', replaced: replaced ? 1 : 0 })
       if (replaced) replaced.close(CLOSE_REPLACED, 'replaced_by_newer_socket')
-      // 主机重连：把它名下的会话作为"有对端在听"的通知重放给已连接的客户端，
-      // 让客户端知道可以继续用原 convId（D3/D6 的续用面）。
-      for (const conversationId of state.conversationIdsForHost(hostId)) {
-        for (const sock of state.clientSockets(conversationId)) {
-          sendTo(sock, { t: 'peer-joined', sessionId: conversationId, clientId: hostId })
-        }
-      }
+      // 这里曾经把该主机名下的会话以 `peer-joined` 重放给已连接的客户端（"主机回来了"）。
+      // 2026-10-06 删除，理由两条，都是读码取证的：
+      // 1. 随仓发布的 mp 客户端 `_onFrame` 里**没有** peer-joined 分支，落进 default 被
+      //    静默忽略——中继为一个不存在的消费者维护一条通知路径；
+      // 2. 那条帧把 hostId 塞进了 clientId 字段，语义就是错的（peer-joined 是"有人进来"，
+      //    这里表达的是"主机回来了"，客户端真按它处理会认错人）。
+      // 客户端续用旧 convId 的真正路径是 `hello-ok` → `cmd.list_sessions`，不依赖这条重放。
       return
     }
 
@@ -286,6 +352,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // 客户端自带 clientId 时**原样保留**：小程序冷启动后仍会用存储里那个 installId，
       // 若这里另发一个，D3 的重挂与 D4 的成员校验会在下次冷启动时永远对不上。
       const clientId = frame.clientId?.trim() || randomUUID()
+      releaseIdentityFor(peer, { role: 'client', id: clientId })
       const { replaced } = state.attachClient(clientId, peer.ws)
       peer.role = 'client'
       peer.clientId = clientId
@@ -431,8 +498,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
     if (peer.role === 'client') {
       const host = state.hostSocket(frame.sessionId)
       if (!host) {
+        // 与单帧路径（forwardEnc）**逐条对齐**：会话还在、主机暂时不在时
+        // 既要回 `host_unavailable`（客户端才知道"这条没人接、等等再发"），
+        // 也**不能** touchConversation——那一帧根本没送到任何人手上，给它续命
+        // 等于让一条没人接的会话在空闲 TTL 上永不过期（P2 的不对称缺陷）。
         counters.droppedFrames += 1
-        state.touchConversation(frame.sessionId)
+        sendError(peer, 'host_unavailable')
         return
       }
       sendTo(host, { t: 'enc-batch', sessionId: frame.sessionId, items: frame.items })
@@ -534,7 +605,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
       ws.close(1013, 'server_shutdown')
       return
     }
-    if (wss.clients.size + 1 > config.maxConnections) {
+    // 计数**必须**是 `wss.clients.size` 本身：这条回调跑的时候 `ws` 已经被
+    // `WebSocketServer` 加进 `clients`（ws 在 `completeUpgrade` 里先 `clients.add(ws)`
+    // 再回调），旧写法 `+ 1` 把新连接算了两次 → `DRC_MAX_CONNS=3` 实际只收 2 条。
+    if (wss.clients.size > config.maxConnections) {
       ws.close(1013, 'server_busy')
       return
     }
@@ -600,8 +674,21 @@ export function createRelay(config: RelayConfig): RelayHandle {
         // 区分两种"看不懂"：帧名根本不认识（unknown_frame）与
         // 名字对但形状不合法（bad_frame）。手机端会把它们当普通错误提示，
         // 但排错时这个区别很值钱——前者是对端版本不对，后者是它发了坏数据。
+        //
+        // 分流判据是"`t` 是不是协议里已存在的帧名"（F1 那张冻结表 + resync/session-leave
+        // 两条后加的）：旧实现只看 `typeof t === 'string'`，于是 `{t:'enc'}`（缺 ciphertext）
+        // 这种"名字对、形状坏"的帧被报成 unknown_frame——与紧邻注释承诺的恰好相反，
+        // 排障时会把"对端发了坏数据"误读成"对端版本不对"。
         const name = (parsed as { t?: unknown } | null)?.t
-        sendError(peer, typeof name === 'string' ? 'unknown_frame' : 'bad_json')
+        if (typeof name !== 'string') {
+          sendError(peer, 'bad_json')
+          return
+        }
+        if (!KNOWN_FRAME_NAMES.has(name)) {
+          sendError(peer, 'unknown_frame', name)
+          return
+        }
+        sendError(peer, 'bad_frame', `frame "${name}" has an invalid shape`)
         return
       }
       if ((frame.t === 'enc' || frame.t === 'enc-batch') && !ciphertextsAreBase64(frame)) {
@@ -805,31 +892,70 @@ export function createRelay(config: RelayConfig): RelayHandle {
     }
   }
 
+  /**
+   * HTTP 面。**整段包在 try/catch 里，且绝不把异常抛给进程**（P0-1）。
+   *
+   * 为什么这条是 P0：`new URL(req.url, \`http://${req.headers.host}\`)` 里只要
+   * `Host` 是 `[`、`x:99999` 这种畸形值，URL 解析就**同步抛** TypeError；它在 request
+   * listener 里，Node 不兜底 → 冒到 `main.ts` 的 uncaughtException → `exit(1)`。
+   * 一个**未认证**的 HTTP 请求就能把中继打挂（默认绑回环时本机任意进程可打，
+   * `DRC_BIND=0.0.0.0` + 容器发布端口时公网直达；systemd `Restart=always` 会把
+   * 它变成重启循环，内存里的会话表每次都被清空）。实测：`GET /healthz` + `Host: [`
+   * → 无响应、进程 exit 1、日志 `uncaught exception: Invalid URL`。
+   *
+   * 两道防线：
+   * 1. URL 的 base **不用客户端给的 Host**（固定 `http://relay.invalid`），
+   *    只从 `req.url` 取 path/query——Host 头对路由本来就没有意义（路径不设限）；
+   * 2. 整段 try/catch：真出现别的畸形（例如 absolute-form 里带坏 host 的 req.url）
+   *    也只回 500，进程继续服务。
+   */
   function httpHandler(req: IncomingMessage, res: ServerResponse): void {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-    res.setHeader('content-type', 'application/json; charset=utf-8')
-    if (url.pathname === '/healthz') {
-      res.end(JSON.stringify(health()))
-      return
-    }
-    if (url.pathname === '/api/info') {
-      res.end(JSON.stringify({ publicUrl: config.publicUrl, protocol: 1 }))
-      return
-    }
-    if (url.pathname === '/api/pair-status') {
-      // 默认 404：开等于给 6 位码空间装了个免认证的判定 oracle。
-      if (!config.pairStatusEnabled) {
-        res.statusCode = 404
-        res.end(JSON.stringify({ error: 'not_found' }))
+    try {
+      const url = new URL(req.url ?? '/', 'http://relay.invalid')
+      res.setHeader('content-type', 'application/json; charset=utf-8')
+      if (url.pathname === '/healthz') {
+        res.end(JSON.stringify(health()))
         return
       }
-      const token = url.searchParams.get('token') ?? ''
-      const entry = state.pendingPairs.get(token)
-      res.end(JSON.stringify({ ok: !!entry && !entry.used && entry.expiresAt >= Date.now() }))
-      return
+      if (url.pathname === '/api/info') {
+        res.end(JSON.stringify({ publicUrl: config.publicUrl, protocol: 1 }))
+        return
+      }
+      if (url.pathname === '/api/pair-status') {
+        // 默认 404：开等于给 6 位码空间装了个免认证的判定 oracle。
+        if (!config.pairStatusEnabled) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ error: 'not_found' }))
+          return
+        }
+        // 开了之后也必须限流（P2）：这是一条**无认证**的 "这个码在不在" 判定接口，
+        // 10^6 的码空间不设配额就是一台免费的枚举机。配额用与配对同一只 Budget，
+        // 用尽回 429 并记 warn——warn 是刻意的，压测/探测会在这里留下痕迹。
+        if (!pairStatusBudget.take(Date.now())) {
+          log.warn('pair-status budget exhausted', { reason: 'rate_limited' })
+          res.statusCode = 429
+          res.end(JSON.stringify({ error: 'rate_limited' }))
+          return
+        }
+        const token = url.searchParams.get('token') ?? ''
+        const entry = state.pendingPairs.get(token)
+        res.end(JSON.stringify({ ok: !!entry && !entry.used && entry.expiresAt >= Date.now() }))
+        return
+      }
+      res.statusCode = 404
+      res.end(JSON.stringify({ error: 'not_found' }))
+    } catch (e) {
+      log.warn('http request failed', { message: String((e as Error)?.message ?? e) })
+      try {
+        if (!res.headersSent) {
+          res.statusCode = 500
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+        }
+        res.end(JSON.stringify({ error: 'internal' }))
+      } catch {
+        // 连回一个 500 都失败（对端已经走了）：到此为止，**绝不**再抛。
+      }
     }
-    res.statusCode = 404
-    res.end(JSON.stringify({ error: 'not_found' }))
   }
 
   const http = createServer(httpHandler)
@@ -849,10 +975,38 @@ export function createRelay(config: RelayConfig): RelayHandle {
       socket.destroy()
       return
     }
-    // 路径不设限：已发布的地址里既有根路径也有 /ws 之类，收窄会让老地址全部连不上。
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req)
-    })
+    try {
+      // 路径不设限：已发布的地址里既有根路径也有 /ws 之类，收窄会让老地址全部连不上。
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req)
+      })
+    } catch (e) {
+      // 与 httpHandler 同一条纪律：HTTP 侧的任何异常都不许冒到进程（P0-1）。
+      log.warn('websocket upgrade failed', { message: String((e as Error)?.message ?? e) })
+      try {
+        socket.destroy()
+      } catch {
+        /* 已经没了 */
+      }
+    }
+  })
+  /**
+   * 畸形请求行/头（例如 `GET /healthz HTTP/1.1` 配上读不完的头）会让 Node 直接
+   * 抛 `clientError`；没有监听者时它的默认处理是写一个 400 然后销毁 socket——
+   * 但**有监听者**却不写应答，就会让那条 socket 悬着。这里显式收口：记一条日志、
+   * 尽力回 400、销毁，绝不抛。
+   */
+  http.on('clientError', (error, socket) => {
+    log.warn('http client error', { message: String((error as Error)?.message ?? error) })
+    if (!socket.writable) {
+      socket.destroy()
+      return
+    }
+    try {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    } catch {
+      socket.destroy()
+    }
   })
   wss.on('connection', (ws) => onConnection(ws))
 
@@ -865,6 +1019,24 @@ export function createRelay(config: RelayConfig): RelayHandle {
     if (persistence.enabled) persistNow()
     wss.clients.forEach((ws) => ws.close(1001, 'server_shutdown'))
     await new Promise<void>((resolve) => http.close(() => resolve()))
+    // **排空之后再写一次**（P2）：第一次写发生在 `ws.close()` 之前，而这之后
+    // socket 的 `close` 回调还会改状态（`clientGone` 更新 lastActivityAt、
+    // 主机掉线打宽限期计时……）——只写一次的话，盘上永远是"开始停机那一刻"的版本，
+    // 那段窗口里的变更随进程一起消失。第二次写补齐它。
+    if (persistence.enabled) persistNow()
+  }
+
+  /**
+   * 兜底停机（`main.ts` 的 5 秒守卫）：排空没能完成时调它。
+   *
+   * 补写一次盘——这时内存表就是最新真相，不写等于把这次停机期间的全部变更丢掉。
+   * 同时把 `shutdownForced` 记进 `/healthz`：兜底 exit(0) 与"排空成功"同码，
+   * 光看退出码分不出这两种停机，计数是运维唯一能事后分辨的出口。
+   */
+  function forceShutdown(): void {
+    counters.shutdownForced += 1
+    if (persistence.enabled) persistNow()
+    log.warn('shutdown forced', { shutdownForced: counters.shutdownForced })
   }
 
   function startListening(): Promise<{ port: number; bind: string }> {
@@ -884,5 +1056,5 @@ export function createRelay(config: RelayConfig): RelayHandle {
     })
   }
 
-  return { http, wss, state, log, health, close, startListening }
+  return { http, wss, state, log, health, close, forceShutdown, startListening }
 }

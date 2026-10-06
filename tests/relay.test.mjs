@@ -5,6 +5,9 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
 import { createRelay } from '../dist/src/server.js'
@@ -509,12 +512,19 @@ test('畸形输入一律被拒而不崩：非法 JSON、二进制帧、坏 base6
     client.send({ t: 'heartbeat' })
     assert.equal((await client.until((f) => f.t === 'error' && f.code === 'unknown_frame')).code, 'unknown_frame')
 
+    // 名字认识、形状不合法 → bad_frame（P2）：旧实现一律回 unknown_frame，
+    // 与紧邻的注释承诺相反，排障时会把"对端发了坏数据"误读成"对端版本不对"。
     client.send({ t: 'enc', sessionId: 'c_000000000000' })
-    assert.equal(
-      (await client.until((f) => f.t === 'error' && f.code === 'unknown_frame')).code,
-      'unknown_frame',
-      '缺 ciphertext 的形状不合法',
+    const malformed = await client.until(
+      (f) => f.t === 'error' && f.code === 'bad_frame' && /enc/.test(f.message ?? ''),
     )
+    assert.equal(malformed.code, 'bad_frame', `缺 ciphertext 是"名字对、形状坏"：${JSON.stringify(malformed)}`)
+    assert.match(malformed.message, /enc/, '要能看出是哪条帧坏了')
+
+    // 中继→端点那一侧的帧名（peer-left 等）在被端点发上来时也是"名字认识但形状不合法"。
+    client.send({ t: 'peer-left', sessionId: 'c_000000000000' })
+    const relayOnly = await client.until((f) => f.t === 'error' && /peer-left/.test(f.message ?? ''))
+    assert.equal(relayOnly.code, 'bad_frame')
 
     client.send({ t: 'enc', sessionId: 'c_000000000000', ciphertext: '%%%not base64%%%' })
     assert.equal((await client.until((f) => f.t === 'error' && f.code === 'bad_frame')).code, 'bad_frame')
@@ -850,6 +860,141 @@ test('慢消费者：同样超限 1 秒，主机该断、客户端不该断（�
     assert.equal(client.closeCode, null, '客户端超限 1 秒不许断：10s 这类短窗口正是把手机打进重连循环的原因')
   } finally {
     await ctx.close()
+  }
+})
+
+test('P1-2：同一 socket 二次 hello 换 clientId，旧键必须释放（未认证即可让 clients 无界增长）', async () => {
+  const ctx = await startRelay()
+  try {
+    const peer = await Peer.connect(ctx.url)
+    ctx.open.push(peer)
+    peer.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'first-id' })
+    await peer.until((f) => f.t === 'hello-ok')
+    assert.equal(ctx.relay.state.clients.has('first-id'), true)
+
+    // 同一条连接换身份：旧实现只 set 新键，close 时又只按最后一次的 clientId 调
+    // clientGone —— 旧键永远留在表里。实测单连接 3000 个 id → clients:499。
+    peer.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'second-id' })
+    const ok = await peer.until((f) => f.t === 'hello-ok' && f.clientId === 'second-id')
+    assert.equal(ok.clientId, 'second-id')
+    assert.equal(
+      ctx.relay.state.clients.has('first-id'),
+      false,
+      '旧 clientId 必须被释放，否则未认证即可让这张 Map 无界增长',
+    )
+    assert.equal(ctx.relay.state.clients.size, 1, '同一 socket 只该占一个键')
+    assert.equal((await fetch(`http://127.0.0.1:${ctx.port}/healthz`).then((r) => r.json())).clients, 1)
+
+    // 关掉之后不许有任何残留（旧实现的残留会一直挂到进程重启）。
+    peer.ws.terminate()
+    await peer.closed
+    await sleep(100)
+    assert.equal(ctx.relay.state.clients.size, 0, 'socket 关闭后仍残留 clientId 键')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('P1-2：主机同 socket 换 hostId 也要释放旧键（同形缺陷，只是这一侧需要 token）', async () => {
+  const ctx = await startRelay()
+  try {
+    const host = await Peer.connect(ctx.url)
+    ctx.open.push(host)
+    host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId: 'host-one' })
+    await host.until((f) => f.t === 'hello-ok')
+    host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId: 'host-two' })
+    await host.until((f) => f.t === 'hello-ok' && f.hostId === 'host-two')
+    assert.equal(ctx.relay.state.hosts.has('host-one'), false, '旧 hostId 键必须被释放')
+    assert.equal(ctx.relay.state.hosts.size, 1)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('主机重连不再向客户端重放 peer-joined（随仓 mp 客户端没有这条分支，且字段是错的）', async () => {
+  const ctx = await startRelay()
+  try {
+    const { host, client, conversationId, hostId } = await pairUp(ctx)
+    // 主机换一条 socket 回来（同一个 hostId）：旧实现在这里向已连接的客户端发
+    // `peer-joined`，而 mp 客户端的 `_onFrame` 里没有这个分支（落 default 静默忽略），
+    // 字段还把 hostId 塞进了 clientId。既然没人消费，就不该有这条假信号。
+    const reborn = await Peer.connect(ctx.url)
+    ctx.open.push(reborn)
+    reborn.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId })
+    await reborn.until((f) => f.t === 'hello-ok')
+    await client.expectNone((f) => f.t === 'peer-joined', 300)
+
+    // 但"主机回来了"这件事本身照旧成立：下行密文仍能路由到客户端。
+    reborn.send({ t: 'enc', sessionId: conversationId, ciphertext: CIPHER })
+    assert.equal((await client.until((f) => f.t === 'enc')).sessionId, conversationId)
+    void host
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('P2：客户端上行 enc-batch 在主机缺席时也要回 host_unavailable，且不许 touchConversation', async () => {
+  const ctx = await startRelay({ DRC_HOST_GRACE_MS: '60000' })
+  try {
+    const { host, client, conversationId } = await pairUp(ctx)
+    // 把活动时间钉在一个可辨认的过去值：touch 过就会变成 now。
+    ctx.relay.state.conversations.get(conversationId).lastActivityAt = 1
+    host.ws.terminate()
+    await sleep(50)
+    client.send({ t: 'enc-batch', sessionId: conversationId, items: [{ ciphertext: CIPHER }] })
+    const err = await client.until((f) => f.t === 'error')
+    assert.equal(err.code, 'host_unavailable', '与单帧路径对齐：主机不在要给可恢复的错误，而不是静默丢弃')
+    assert.equal(
+      ctx.relay.state.conversations.get(conversationId).lastActivityAt,
+      1,
+      '这一批根本没送到任何人手上，不许给它续命（否则没人接的会话在空闲 TTL 上永不过期）',
+    )
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('停机：排空之后再补写一次盘（关 socket 之前的写看不到排空期间的变更）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drc-stop-'))
+  const stateFile = join(dir, 'state.json')
+  const ctx = await startRelay({ DRC_STATE_FILE: stateFile, DRC_STATE_SAVE_MS: '3600000' })
+  try {
+    const { client } = await pairUp(ctx)
+    const before = ctx.relay.health().stateWrites
+    // "排空期间的最后一次变更"：http 'close' 的监听器按注册顺序先于 close() 的回调跑，
+    // 所以这次改动一定落在"关 socket 前那一次写盘"之后、收尾写盘之前。
+    ctx.relay.http.on('close', () => {
+      ctx.relay.state.conversations.values().next().value.seqHost = 424242
+    })
+    await ctx.relay.close()
+    assert.equal(
+      ctx.relay.health().stateWrites,
+      before + 2,
+      '停机必须写两次：关 socket 前一次、排空后一次（旧实现只写前一次，排空期间的变更随进程消失）',
+    )
+    const onDisk = JSON.parse(readFileSync(stateFile, 'utf8'))
+    assert.equal(onDisk.conversations[0].seqHost, 424242, '排空期间的变更没落盘：第二次写发生在它之前')
+    void client
+  } finally {
+    await ctx.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('停机兜底：forceShutdown 补写一次盘并把 shutdownForced 记进 /healthz', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drc-forced-'))
+  const stateFile = join(dir, 'state.json')
+  const ctx = await startRelay({ DRC_STATE_FILE: stateFile, DRC_STATE_SAVE_MS: '3600000' })
+  try {
+    await pairUp(ctx)
+    assert.equal(ctx.relay.health().shutdownForced, 0, '正常排空不该有这个计数')
+    ctx.relay.forceShutdown()
+    const health = ctx.relay.health()
+    assert.equal(health.shutdownForced, 1, '兜底停机必须留下计数：它与排空成功同码 exit(0)，退出码分不出来')
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).version, 1, '兜底路径也要补写一次盘')
+  } finally {
+    await ctx.close()
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 

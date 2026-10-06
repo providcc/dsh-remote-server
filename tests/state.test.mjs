@@ -354,3 +354,35 @@ test('P2-⑤ resync 时才知道的空会话：从这一时刻起算，不会挂
   advance(ttl)
   assert.deepEqual(state.sweepEmpty(ttl), [conversationId], '重启前就掏空的会话也不许多挂')
 })
+
+test('resync 的 kept 数的是"真的被留下的会话"，不是声明里的 id 数', () => {
+  const clock = { now: 1_000 }
+  const state = new RelayState({ now: () => clock.now })
+  const h1 = new FakeSock('h1')
+  const h2 = new FakeSock('h2')
+  const client = new FakeSock('c')
+  state.attachHost('h1', h1, 'one')
+  state.attachHost('h2', h2, 'two')
+  state.attachClient('inst-1', client)
+
+  state.issuePair('h1', '111111', 180_000)
+  const a = state.claim('111111', 'inst-1')
+  state.issuePair('h1', '222222', 180_000)
+  const b = state.claim('222222', 'inst-1')
+  state.issuePair('h2', '333333', 180_000)
+  const foreign = state.claim('333333', 'inst-1')
+  assert.equal(foreign.ok, true)
+
+  // 声明里塞进：不属于它的会话 + 一条根本不存在的 convId。
+  // 旧写法 `claimed.size - dropped.length` 会把这些一起算进 kept（4 而不是 2），
+  // 而这条日志正是运维判断"主机还记得几条会话"的唯一出口。
+  const verdict = state.resync('h1', [a.conversationId, b.conversationId, foreign.conversationId, 'c_ffffffffffff'])
+  assert.equal(verdict.kept, 2, `kept 虚高：${JSON.stringify(verdict)}`)
+  assert.deepEqual(verdict.dropped, [])
+  assert.equal(state.conversations.has(foreign.conversationId), true, '别的主机的会话不许被 resync 删掉')
+
+  // 反向：真删掉一条时 kept 也不能被算成 0（旧写法 1 - 1 = 0）。
+  const second = state.resync('h1', [a.conversationId])
+  assert.equal(second.kept, 1, 'kept 必须等于实际留下的条数')
+  assert.deepEqual(second.dropped, [b.conversationId])
+})
