@@ -20,6 +20,9 @@
  * 重连周期推导出来的不变量，不是性能偏好。把它调到 42.5s 以下就等于把那台
  * "被踢→秒回→再被踢"的 ~11s 循环发动机装回去（DESIGN-REVIEW 第 11 条，
  * `tests/limits.test.mjs` 直接读 mp 源码的常量来锁这条）。可调只是为了测试能缩短等待。
+ *
+ * 会话表落盘（`DRC_STATE_FILE`，HANDOFF §1.1）**默认关闭**：本地随手起的中继不该
+ * 多出一个状态文件，而"配对随中继重启全丢"只发生在长期运行的那一个实例上。
  */
 
 import { CLIENT_SLOW_CONSUMER_MS, HOST_SLOW_CONSUMER_MS } from './limits.js'
@@ -65,6 +68,25 @@ export interface RelayConfig {
   slowConsumerClientMs: number
   logLevel: LogLevel
   pairStatusEnabled: boolean
+  /**
+   * 会话表落盘路径。**空串 = 关闭**（默认）。
+   *
+   * 默认关是刻意的：本地起一个中继（开发、测试、临时演示）不该凭空多出一个状态文件，
+   * 而"配对会丢"这件事恰恰只发生在**长期运行**的那一个实例上。
+   * 开了之后启动会先读它、之后按结构性变更写它，见 `persist.ts`。
+   */
+  stateFile: string
+  /**
+   * 周期性补写状态文件的间隔（默认 60 s）。结构性变更（建会话/删会话）本来是立刻落盘的，
+   * 这一条只负责**刷新 `lastActivityAt`**——它在每一帧转发时都被更新，却从来不触发写盘
+   *（否则每帧一次 fsync）。
+   *
+   * 不补写会怎样：一条天天在用的会话，`lastActivityAt` 可能停在文件里很久以前；
+   * 哪天中继重启，它一读回来就已经过了 7 天空闲 TTL，`sweepIdle` 立刻把它剪掉，
+   * 手机被迫重新扫码——正是 §1.1 要消灭的那种故障，只是换了个触发条件。
+   * 60 s 的粒度相对 7 天的 TTL 相当于无穷小。
+   */
+  stateSaveMs: number
   version: string
 }
 
@@ -162,6 +184,9 @@ export function loadConfig(
     ),
     logLevel: level,
     pairStatusEnabled: env.DRC_PAIR_STATUS === '1' || env.DRC_PAIR_STATUS === 'true',
+    // 空串显式当作"关闭"：DRC_STATE_FILE= 也要能关掉，而不是被 ?? 还原成默认路径。
+    stateFile: env.DRC_STATE_FILE ?? '',
+    stateSaveMs: integer(env.DRC_STATE_SAVE_MS, 60_000, 'DRC_STATE_SAVE_MS'),
     version,
   }
   return { config, problems }

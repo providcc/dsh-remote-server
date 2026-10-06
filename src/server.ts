@@ -10,6 +10,11 @@
  * 与旧实现的四条行为差异（全部经用户拍板，docs/DESIGN.md §4、§8）：
  * D1 不接收 PSK、D2 配对码不落 info 日志、D3 客户端断开不删会话、
  * D4 转发前校验发送方是会话成员、D5 `auth` 并入 `hello`、D6 主机断开有宽限期。
+ *
+ * 落盘（`DRC_STATE_FILE`，HANDOFF §1.1 方案 A）**默认关闭**，启用时只影响会话表：
+ * 启动读回（`createRelay` 里、listen 之前）、结构性变更立刻写、清扫周期补写。
+ * 它不改变安全模型，也不碰 `hosts` / `clients` / `pendingPairs`——那三张表是活连接与
+ * 短命状态，落盘它们只会造出"幽灵对端"。详见 `persist.ts`。
  */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
@@ -38,6 +43,7 @@ import {
 import type { RelayConfig } from './config.js'
 import { BackpressureGate, Budget, FrameRateGate } from './limits.js'
 import { Log, REDACTED } from './log.js'
+import { restoreState, snapshotState, writeStateFile } from './persist.js'
 import { RelayState, WS_OPEN, type Sock } from './state.js'
 
 /** 保留的自定义关闭码：同 hostId 顶号。客户端的重连策略不认识它，只对主机有意义。 */
@@ -93,6 +99,50 @@ export function createRelay(config: RelayConfig): RelayHandle {
   let lastPingAt = 0
   /** 上一次把计数器抄进日志的时刻（0 = 还没抄过，所以启动后第一轮就抄）。 */
   let lastCountersAt = 0
+
+  // ── 会话表落盘（HANDOFF §1.1 方案 A，DRC_STATE_FILE 未设时整段是死代码）──
+
+  /**
+   * 启动时先读回，再 listen。
+   *
+   * 放在 `createRelay` 里（而不是 `startListening`）是有意的：`main.ts` 的顺序是
+   * `createRelay` → `startListening`，所以这里跑的时候**还没有任何 socket 能进来**，
+   * 内存表就是干净的读回结果。反过来放在 listen 之后，就有一个真实的竞态——
+   * 主机在读盘完成前连上来发 `resync()`，那轮 resync 会按"服务器现有的表"去删，
+   * 而此时表还没读回来，于是它把主机刚声明的会话全删了（复核 R1 的老坑）。
+   *
+   * 读坏了/没有文件都按空启动，绝不拒绝启动（`persist.ts` 的纪律第 2 条）。
+   */
+  const persistence = { enabled: config.stateFile !== '', restored: 0, savedAt: 0, writes: 0, failures: 0 }
+  if (persistence.enabled) persistence.restored = restoreState(config.stateFile, state, log, startedAt)
+
+  /** 真正写一次盘。返回是否成功——失败只计数，不抛（见 writeStateFile 的注释）。 */
+  function persistNow(): boolean {
+    if (!persistence.enabled) return false
+    const ok = writeStateFile(config.stateFile, snapshotState(state, Date.now()), log)
+    if (ok) {
+      persistence.writes += 1
+      persistence.savedAt = Date.now()
+    } else {
+      persistence.failures += 1
+    }
+    return ok
+  }
+
+  /**
+   * 会话表发生**结构性**变化后立刻落盘（建/删会话、成员表变动）。
+   *
+   * 为什么只盯结构性变化、不盯每一帧：`lastActivityAt` 每转发一帧就更新，
+   * 跟着它写就是每帧一次 fsync——那不是持久化，那是自造 DoS。
+   * 它的保鲜交给周期性补写（见 sweep 里的 `maybePersistPeriodic`）。
+   *
+   * 为什么删除路径必须走它（纪律第 3 条）：只在"建"的时候写，删掉的会话会永远留在盘上，
+   * 重启时又被读回来——**已经作废的会话被复活**，而主机那边的 `resync` 还要再花一轮
+   * 才把它清掉。这正是验收第 5 条盯的那个失败模式。
+   */
+  function markStateChanged(): void {
+    persistNow()
+  }
 
   /**
    * ping 分桶轮转（C1）。桶数 = 心跳周期 / tick，每 tick 只 ping 一个桶。
@@ -313,6 +363,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
     sendToPeer(peer, pairedFrameOf(claimed.conversationId, claimed.hostId))
     // 发给主机的那一条**必须带 pairingToken**：主机按它取自己那份 PSK（多码并存事故）。
     sendToPeer(peerOfHost(claimed.hostId), peerJoinedForHost(claimed.conversationId, peer.clientId, frame.pairingToken))
+    // 配对是**运行期唯一的会话创建点**（第二个入口是启动读回），所以它是落盘的关键时刻：
+    // 这一次不写，下一次落盘之前中继重启，这条刚建立的配对就随内存一起没了。
+    // 一次落盘换一次扫码，这个代价比什么都划算。
+    markStateChanged()
     log.info('paired', {
       sessionId: claimed.conversationId,
       hostId: claimed.hostId,
@@ -414,8 +468,11 @@ export function createRelay(config: RelayConfig): RelayHandle {
           return
         }
         const { kept, dropped } = state.resync(peer.hostId, frame.sessionIds)
-        if (dropped.length > 0)
+        // resync 会**删**会话，也会在留下的会话上打空会话计时，两种都进盘。
+        if (dropped.length > 0) {
           log.info('conversations dropped at host resync', { hostId: peer.hostId, kept, dropped: dropped.length })
+          markStateChanged()
+        }
         return
       }
       case 'enc':
@@ -442,6 +499,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
             sessionId: frame.sessionId,
             clients: (dropped?.clientIds ?? []).length,
           })
+          // 主机作废 = 永久删除。不同步删盘的话重启会把它读回来（验收第 5 条）。
+          markStateChanged()
           return
         }
         if (!peer.clientId) {
@@ -456,6 +515,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
           // （2026-10-05 用户报）。socket 关闭那条路**不带**这个标记 —— 那条是掉线，
           // D3 要求会话留着，回前台还要用同一把钥匙。
           sendTo(state.hostSocket(frame.sessionId), peerLeftFrame(frame.sessionId, peer.clientId, true))
+          // 成员表变了（少一个人），且可能顺带打上了空会话回收计时——两者都要落盘。
+          markStateChanged()
         }
         return
       }
@@ -603,6 +664,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       if (ws.readyState === WS_OPEN) noteBackpressure(peer, backpressureAt)
     })
     // D6：超过宽限期仍没回来的主机，才真正通知它的客户端重配对。
+    let droppedByGrace = 0
     for (const dropped of state.expireOfflineHosts(config.hostGraceMs)) {
       // 这里曾经误写成**嵌套两层同一个 clientIds**（外层内层同名），于是每个客户端收到
       // N 条 `peer-left` 而不是 1 条：帧数随成员数平方增长，手机还会把同一次"主机离开"
@@ -610,19 +672,40 @@ export function createRelay(config: RelayConfig): RelayHandle {
       for (const clientId of dropped.clientIds) {
         sendTo(state.clients.get(clientId)?.ws, peerLeftFrame(dropped.conversationId, dropped.hostId))
       }
+      droppedByGrace += 1
       log.info('host grace expired', { hostId: dropped.hostId, sessions: dropped.conversationId })
     }
-    for (const conversationId of state.sweepIdle(config.conversationIdleTtlMs)) {
+    const idleDropped = state.sweepIdle(config.conversationIdleTtlMs)
+    for (const conversationId of idleDropped) {
       log.info('conversation idle-dropped', { sessionId: conversationId })
     }
     // P2-⑤：只剩主机、没有客户端的会话，最后一个客户端走后 emptyTtl 就回收。
     // 不发任何帧给谁：这条路上"还有客户端"这件事已经不成立（有客户端也不会进这里），
     // 而主机侧会话本来就与中继这张表各自独立（resync 会重新声明）。
-    for (const conversationId of state.sweepEmpty(config.conversationEmptyTtlMs)) {
+    const emptyDropped = state.sweepEmpty(config.conversationEmptyTtlMs)
+    for (const conversationId of emptyDropped) {
       log.info('conversation empty-dropped', { sessionId: conversationId })
     }
+    // 回收同步删盘（纪律第 3 条）：空会话回收与空闲剪枝都是"永久删除"，不同步的话
+    // 重启会把它们读回来复活。三条删除路径共用这一次落盘——它们本来就同属一轮清扫，
+    // 一轮写一次，而不是删几个就写几次。
+    if (droppedByGrace > 0 || idleDropped.length > 0 || emptyDropped.length > 0) markStateChanged()
+    else maybePersistPeriodic()
     // 计数器快照借这一轮的节拍，但它**不是**表项生命周期的一部分（见 logCountersIfDue 的注释）。
     logCountersIfDue()
+  }
+
+  /**
+   * 周期性补写，只为刷新 `lastActivityAt`（见 config.ts 里 `stateSaveMs` 的注释）。
+   *
+   * 挂在 sweep 这一轮上而不是另开定时器：sweep 本来就每 `sweepMs` 醒一次，
+   * 再加一个定时器只是多一条要维护的生命周期。
+   */
+  function maybePersistPeriodic(): void {
+    if (!persistence.enabled) return
+    const now = Date.now()
+    if (now - persistence.savedAt < config.stateSaveMs) return
+    persistNow()
   }
 
   /**
@@ -709,6 +792,14 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // "手机不更新"这类排查分不清"现在是空的"和"一直送不出去"。
       ...state.counts(),
       ...counters,
+      // 落盘的可观测面。**刻意不暴露文件路径**：`/healthz` 是公网可达的，
+      // 而一个绝对路径对排障没用、对探测者有用（告诉它这台机器上有什么、装在哪）。
+      // 运维要知道路径看环境变量就够了。
+      persistence: persistence.enabled ? 'on' : 'off',
+      stateRestored: persistence.restored,
+      stateSavedAtSec: persistence.savedAt === 0 ? -1 : Math.round((Date.now() - persistence.savedAt) / 1000),
+      stateWrites: persistence.writes,
+      stateWriteFailures: persistence.failures,
       lastPingAgo: lastPingAt === 0 ? -1 : Math.round((Date.now() - lastPingAt) / 1000),
       shuttingDown,
     }
@@ -769,6 +860,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
     if (sweepTimer) clearInterval(sweepTimer)
     if (pingTimer) clearInterval(pingTimer)
     shuttingDown = true
+    // 停机前补一次盘：把"关掉之后"这段时间里的活动写进去。
+    // 这一写也让"关机前最后状态"与"重启后读到的状态"一致，排障时不必去猜中间发生了什么。
+    if (persistence.enabled) persistNow()
     wss.clients.forEach((ws) => ws.close(1001, 'server_shutdown'))
     await new Promise<void>((resolve) => http.close(() => resolve()))
   }
