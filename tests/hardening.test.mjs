@@ -329,9 +329,12 @@ test('超长自报字段不许放大日志：单行有界（P1-3）', async () =
   try {
     const peer = connect(server.url)
     await peer.opened
-    // 400 KiB 的 clientMeta.platform：协议侧上限由 Lead 补（max 128），
-    // 中继这一侧必须自己扛住——journald 按**条数**限流，不按字节，
-    // 一条 409 KB 的行和一条 40 字节的行占同一个配额。
+    // 400 KiB 的 clientMeta.platform。**协议侧 2026-10-06 起给了 max(128)**，
+    // 于是这一帧在 schema 就被拒（unknown_frame）、根本进不到日志——
+    // 这是比"截断后照登"更强的结果，所以判据跟着它走：
+    // ① 没有任何一行被放大；② 这条连接**没有**被登记（没有 client online）。
+    // 中继自己的值截断（256 字符）仍然保留：它是防御纵深——协议上限之外的字段
+    // （错误文案、内部 id）也照样会被写进日志。
     peer.send({
       t: 'hello',
       role: 'client',
@@ -342,11 +345,32 @@ test('超长自报字段不许放大日志：单行有界（P1-3）', async () =
     await sleep(150)
     const longest = server.lines.reduce((max, line) => Math.max(max, Buffer.byteLength(line)), 0)
     assert.ok(longest <= 1024, `单行日志 ${longest} 字节：对端自报字段把日志放大了`)
-    assert.ok(
+    assert.equal(
       server.lines.some((line) => line.includes('client online')),
-      '截断不许把整条日志吞掉：client online 仍要留下',
+      false,
+      '超大 clientMeta 的连接不该被登记：协议上限是第一道闸，它已经挡住了',
     )
     assert.equal(server.child.exitCode, null)
+
+    // 合法但顶格的字段（platform/label 各 128、token 不带）仍要照常登记，
+    // 且日志行有界——防的是"为了挡放大而把正常连接也挡了"。
+    const ok = connect(server.url)
+    await ok.opened
+    ok.send({
+      t: 'hello',
+      role: 'client',
+      clientId: 'max-meta',
+      clientMeta: { platform: 'p'.repeat(128), label: 'l'.repeat(128) },
+    })
+    await waitFrames(ok, 1)
+    await sleep(150)
+    assert.ok(
+      server.lines.some((line) => line.includes('client online') && line.includes('max-meta')),
+      '顶格但合法的 clientMeta 必须照常登记',
+    )
+    const longest2 = server.lines.reduce((max, line) => Math.max(max, Buffer.byteLength(line)), 0)
+    assert.ok(longest2 <= 1024, `顶格字段也要有界：实得 ${longest2}`)
+    ok.ws.close()
   } finally {
     await server.kill()
   }

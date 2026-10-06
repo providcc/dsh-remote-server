@@ -5,7 +5,9 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
-## [Unreleased]
+## [1.0.0-rc.1] - 2026-10-06
+
+> **首个开源候选版。** 四仓统一用这一个版本号；此前的 1.0.x 是私有期编号。
 
 rc1 前的缺陷修复（逐行审计的发现，每条都有判据钉住）。
 

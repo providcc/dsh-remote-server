@@ -15,8 +15,8 @@ importers:
         specifier: ^8.5.12
         version: 8.18.2
       dsh-remote-wire:
-        specifier: ^1.8.0
-        version: 1.8.0
+        specifier: 1.0.0-rc.1
+        version: 1.0.0-rc.1
       esbuild:
         specifier: ^0.28.2
         version: 0.28.2
@@ -314,8 +314,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  dsh-remote-wire@1.8.0:
-    resolution: {integrity: sha512-WxC6d882iRAqAqM2iObAyGFe0+ze9S066jKltGHjSOhfyRxkAYTGgQ4IXhm9ew/oK54sRAmlYAYZwGm/EX1jrA==}
+  dsh-remote-wire@1.0.0-rc.1:
+    resolution: {integrity: sha512-XO3bdMg3wEjlDzBJwLdl+srqRr++YDgmBVU02mtOE1sLpdy5V75Y6N7hzCOtIWW1ovt8ieK547COVsnOe5NdIA==}
     engines: {node: '>=20'}
 
   esbuild@0.28.2:
@@ -502,7 +502,7 @@ snapshots:
   '@typescript/typescript-win32-x64@7.0.2':
     optional: true
 
-  dsh-remote-wire@1.8.0:
+  dsh-remote-wire@1.0.0-rc.1:
     dependencies:
       tweetnacl: 1.0.3
       zod: 4.6.5
