@@ -5,6 +5,32 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [1.0.6] - 2026-10-06
+
+### 新增
+
+- **会话表落盘**（`DRC_STATE_FILE`，**默认关闭**）。配对关系此前只存在内存里，
+  中继一重启全部消失，手机要回到电脑前重新扫码。这不是某次改坏的，是一直如此——
+  以前没暴露，只因为线上那个进程连着跑了 29.7 小时。
+- `/healthz` 新增 `persistence`（on/off）、`stateRestored`、`stateSavedAtSec`、
+  `stateWrites`、`stateWriteFailures`。**刻意不暴露文件路径**：`/healthz` 公网可达，
+  而绝对路径对排障没用、对探测者有用。
+
+### 细节
+
+- 落盘字段：`conversationId` / `hostId` / `clients` / `seqHost` / `lastActivityAt` /
+  `emptySince`。不落 `pendingPairs`（短命 + 一次性语义）与 `hostOfflineSince`。
+- 不落任何秘密：中继结构性零知识，从来不持有 PSK；会话 id 与 client id 本就明文
+  出现在每一帧里，落盘不扩大暴露面。
+- `hostOfflineSince` 刻意不落**也不恢复**：读盘那一刻没有任何主机连着，照搬计时等于
+  宣称"主机从上次落盘起就已离线"，一次 130 秒的停机维护就能让宽限期当场到期、
+  手机照样重扫——比不做落盘更糟。恢复出来的会话一律按"主机在场、只是还没连上"处理。
+- 恢复放在 `createRelay`（listen 之前）：放 listen 之后有真实竞态——主机在读盘完成前
+  连上来发 `resync`，那轮会按"服务器现有的表"去删，把主机刚声明的会话全删掉。
+- 回收同步删盘；只在"建"的时候写的话，已回收的会话会永远留在盘上、重启被复活。
+- 失败一律不致命：写失败只记日志并计数，坏文件按空启动并留痕（起不来的中继等于
+  整个产品停摆）。原子写用同目录临时文件 + `rename`。
+
 ## [1.0.4] - 2026-10-04
 
 ### 新增
