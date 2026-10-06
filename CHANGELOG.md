@@ -31,6 +31,21 @@
 - 失败一律不致命：写失败只记日志并计数，坏文件按空启动并留痕（起不来的中继等于
   整个产品停摆）。原子写用同目录临时文件 + `rename`。
 
+## [1.0.5] - 2026-10-06
+
+### 修复
+
+- `peer-left` 在两条永久失去配对的路径上带上 `unpaired`：客户端显式解绑
+  （`session-leave`）与重新配对摘清旧成员（`leaveAll` detach）。此前主机收到的
+  `peer-left` 不区分"用户主动解绑"与"socket 掉线"，前者会在主机侧留下一条永远
+  清不掉的幽灵会话（pill 永远显示"手机离线"）。socket 关闭那条路**不带**这个
+  标记——那是掉线，会话要留着等手机回来（D3 免扫码）。
+- 有测试钉住这条：只有显式解绑带标记，socket 断开永远不带（`tests/relay.test.mjs`）。
+
+### 变更
+
+- `dsh-remote-wire` 依赖改为已发布的 `^1.8.0`（此前一度指向本地 `file:` 路径）。
+
 ## [1.0.4] - 2026-10-04
 
 ### 新增
@@ -97,6 +112,11 @@
 - **自包含单文件产物**（esbuild），部署退化为"拷一个文件 + 一个 env 文件"。
 - 结构性零知识的机械防线：产物级断言构建产物里不含密码学代码。
 
-[未发布]: https://github.com/providcc/dsh-remote-server/compare/v1.0.0...HEAD
+[未发布]: https://github.com/providcc/dsh-remote-server/compare/v1.0.6...HEAD
+[1.0.6]: https://github.com/providcc/dsh-remote-server/compare/v1.0.5...v1.0.6
+[1.0.5]: https://github.com/providcc/dsh-remote-server/compare/v1.0.4...v1.0.5
+[1.0.4]: https://github.com/providcc/dsh-remote-server/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/providcc/dsh-remote-server/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/providcc/dsh-remote-server/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/providcc/dsh-remote-server/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/providcc/dsh-remote-server/releases/tag/v1.0.0

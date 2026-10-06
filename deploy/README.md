@@ -45,6 +45,9 @@ DRC_PORT=8787
 DRC_PUBLIC_URL=wss://drc.provid.cc
 DRC_PAIR_TTL_MS=90000
 DRC_LOG_LEVEL=info
+# 会话表落盘（默认关闭 = 纯内存模式，重启丢配对；配上之后会话表重启恢复，见 CHANGELOG 1.0.6）
+# 标准生产值（相对路径按 systemd WorkingDirectory 解析）：
+# DRC_STATE_FILE=/var/lib/dsh-remote-control/state.json
 EOF
 chmod 600 /etc/dsh-remote-control.env
 
@@ -104,7 +107,7 @@ scp dist/bundle/main.js root@HOST:/opt/dsh-remote-control/server/relay.mjs
 ssh root@HOST 'systemctl restart dsh-remote-control'
 ```
 
-中继是纯内存的，重启会丢掉配对关系：客户端拿旧 convId 发帧会撞上
+中继默认是纯内存的，未配 `DRC_STATE_FILE` 落盘时重启会丢掉配对关系：客户端拿旧 convId 发帧会撞上
 `error{unknown_session}`，手机上就是中文的"会话已失效，请重新配对"。
 
 ## 安全组
