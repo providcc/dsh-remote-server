@@ -539,10 +539,14 @@ export function createRelay(config: RelayConfig): RelayHandle {
           return
         }
         const { kept, dropped } = state.resync(peer.hostId, frame.sessionIds)
-        // resync 会**删**会话，也会在留下的会话上打空会话计时，两种都进盘。
+        // resync 的两种后果**都**要进盘，所以这里无条件落盘（而不是只在 dropped 时写）：
+        // ① 删会话；② 留下的会话被打上 `lastActivityAt` 与空会话回收计时 `emptySince`。
+        // 只在 ① 时写的话，盘上会留着一个"还空着、却没开始计时"的会话——重启后
+        // `restoreState` 按"此刻起算"补上计时，于是回收被推迟整整一个空会话 TTL。
+        // 主机每次(重)启动只发一条 resync，一次写盘的量可以忽略。
+        markStateChanged()
         if (dropped.length > 0) {
           log.info('conversations dropped at host resync', { hostId: peer.hostId, kept, dropped: dropped.length })
-          markStateChanged()
         }
         return
       }
