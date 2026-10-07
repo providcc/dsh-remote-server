@@ -27,6 +27,7 @@ import {
   type RelayFrame,
 } from 'dsh-remote-wire/frames'
 import { newHostId } from 'dsh-remote-wire/ids'
+import { negotiateProtocol, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION } from 'dsh-remote-wire/negotiate'
 import {
   encBatchToClient,
   encToClient,
@@ -139,6 +140,18 @@ interface Peer {
    * **之后不再变**——所以一个对端两次被 ping 的间隔稳定等于 pingIntervalMs。
    */
   pingBucket: number
+  /**
+   * 对端在 `hello` 里报的协议版本（`undefined` = 没报，按 1 处理，V1）。
+   *
+   * 为什么要在连接上记：版本闸在 `handleFrame` 最前面，而 `hello` 只发一次——
+   * 之后的 `enc` / `ping` / `session-leave` 若每次都靠帧上那个字段判断，
+   * 它们**根本没有**那个字段，于是每一条都会被当成"没报版本"按 1 处理。
+   * 那不是宽容，是**错配**：一个报 999 的主机发 `enc` 时会被当成 1 而放行，
+   * 版本闸只对它第一条 `hello` 有效——恰好等于没闸。
+   */
+  protocol?: number
+  /** 对端没报协议版本（V1 老端点）：只用于 `/healthz` 的观测，不参与判定。 */
+  protocolMissing?: boolean
 }
 
 export interface RelayHandle {
@@ -333,6 +346,19 @@ export function createRelay(config: RelayConfig): RelayHandle {
    * 发给手机侧的**每一条 error 都必须带中文 message**（复核 R2）。
    * 客户端对未知 code 的处理是 `f.message || f.code`，没有 message 就是一条
    * 40 字宽的英文 toast——用户既看不懂也没有下一步。
+   *
+   * ## 为什么它只列**一部分**错误码（不是漏，是刻意的）
+   *
+   * 这张表的前提是"发给 client 的"，而有些码**只可能发给 host**：
+   * `bad_token` / `need_host` / `bad_pair` / `bad_role` 全部发生在 `peer.role !== 'host'`
+   * 或 `peer.role !== 'client'` 的守卫之后（判据 `tests/docs.test.mjs` 里逐条核过
+   * 那些守卫），对端是主机插件而不是人 —— 它自己会打日志，给人看的中文没有意义。
+   * 强行给它们补文案会让这张表**看起来覆盖了全部**而实际不是。
+   *
+   * ⚠️ 反过来，`unsupported_protocol` 必须在这张表里：版本闸在 `handleFrame`
+   * 最前面，那一刻 `peer.role` 还是 `'unknown'`，而手机会把这句错误直接弹给用户 ——
+   * 它属于"人会看到"的那一类，只是恰好在角色还没定的时候就已经要发出去。
+   * （`acceptProtocol` 因此显式传了 message，不依赖这张表。）
    */
   const CLIENT_ERROR_TEXT: Partial<Record<ErrorCode, string>> = {
     unknown_session: '会话已失效，请重新扫码配对',
@@ -344,11 +370,41 @@ export function createRelay(config: RelayConfig): RelayHandle {
     unknown_frame: '对端版本不认识这个帧',
     pair_table_full: '配对表已满，请稍后再试',
     need_client: '需要先从手机侧发起配对',
+    unsupported_protocol: '中继与手机的协议版本不兼容，请把小程序升级到最新版',
     internal: '中继内部错误',
   }
 
-  function sendError(peer: Peer | undefined, code: ErrorCode, message?: string): void {
-    const text = message ?? (peer?.role === 'client' ? CLIENT_ERROR_TEXT[code] : undefined)
+  function sendError(peer: Peer | undefined, code: ErrorCode, message?: string, userHint?: string): void {
+    // ⚠️ **`message` 只给 host 角色**（2026-10-07 审计补）。它是**技术细节**
+    // （`frame "enc" has an invalid shape`、`ciphertext must be standard base64`），
+    // 而客户端的处理是 `f.message || f.code` —— 一旦把英文原文发给手机，
+    // 它就会**顶掉**下面那张中文表（`message` 优先），用户看到的是一句英文。
+    // 而这些帧本不该出现在正常链路上，出现时对用户唯一有用的信息是"这条被丢了"。
+    //
+    // 修法不是"把细节翻译成中文"（那会造出第二套措辞、且日志里读不到原文），
+    // 而是**按角色分流**：host 侧拿原文（插件日志与 status.json 排障靠它），
+    // client 侧拿中文表那句。细节另记日志，两边都不丢。
+    //
+    // ⚠️ 判据是 `role !== 'host'`，**不是** `role === 'client'`：`hello` 之前
+    //   role 还是 `'unknown'`，而那一段（JSON 解析失败、帧形状不对）恰恰是最容易
+    //   发生、也最该给中文的地方 —— 用 `=== 'client'` 判会让它**漏成英文**，
+    //   那正是这条要修的那个缺陷本身（实测：写 `=== 'client'` 时 bad_frame 的
+    //   英文原文照旧到了手机上）。
+    //
+    // ## `userHint`：帧名是**用户也看得懂**的那部分信息
+    //
+    // "是哪条帧坏了"（`enc` / `peer-left` …）对排障有用，对用户也有用 ——
+    // 它能让人判断"是我的小程序版本太老"还是"是网络那一头在发怪东西"。
+    // 所以它不走 `message`（那条是英文技术细节），而走 `userHint`：
+    // **中文表那句 + 括号里的帧名**，两边都不丢信息。
+    // 这个区分不是洁癖：早期版本把 `frame "enc" has an invalid shape` 整句发到手机，
+    // 用户看到的是一句英文；现在看到的是「有一帧数据不合法，已丢弃（enc）」。
+    const toClient = peer?.role !== 'host'
+    const base = toClient ? CLIENT_ERROR_TEXT[code] : message
+    const text = toClient && userHint ? `${base ?? ''}（${userHint}）` : base
+    if (toClient && message) {
+      log.debug('frame rejected', { code, detail: message.slice(0, 120) })
+    }
     sendToPeer(peer, makeErrorFrame(code, text))
   }
 
@@ -415,6 +471,13 @@ export function createRelay(config: RelayConfig): RelayHandle {
   }
 
   function handleHello(peer: Peer, frame: Extract<EndpointFrame, { t: 'hello' }>): void {
+    // 版本闸已经放过这一帧（`handleFrame` 最前面），这里**只把版本记在连接上**，
+    // 让后续那些不带该字段的帧仍按对端的真实版本判定（见 `Peer.protocol` 的注释）。
+    // 记 `frame.protocol` 而不是判定的结果：不报字段的老端点在闸里按 1 处理，
+    // 这里也要存成 `undefined` 而不是 1 —— 否则 `/healthz` 会把"没报"说成"报了 1"。
+    peer.protocol = frame.protocol
+    if (frame.protocol === undefined) peersWithoutProtocol++
+    else peerProtocols.set(frame.protocol, (peerProtocols.get(frame.protocol) ?? 0) + 1)
     if (frame.role === 'host') {
       if (!config.hostToken) {
         sendError(peer, 'internal', 'relay has no host token configured')
@@ -650,10 +713,73 @@ export function createRelay(config: RelayConfig): RelayHandle {
   }
 
   let lastResyncPersistAt = 0
+  /**
+   * 已连上的对端各自报的协议版本 → **计数**（`/healthz` 的观测面，见 health()）。
+   *
+   * ## 为什么是 Map<版本, 计数> 而不是 Set<版本>
+   *
+   * 连接会断开，而两个对端**可以报同一个版本**（现网所有小程序都是 1）。
+   * `Set` 只能加不能减 ⇒ 要么在断开时删掉那个版本（于是把仍在连接的另一个对端
+   * 也一起抹了，`peerProtocolMin` 忽然变成 -1），要么留着不动（**无界增长** ——
+   * 那正是「客户端身份键无界泄漏」那条事故的形状，不能在观测面上重犯）。
+   *
+   * 所以按版本计数：断开时减一，归零时删键。`peerProtocols.size === 0` 就是
+   * "当前没有对端"的判据，语义干净。
+   */
+  const peerProtocols = new Map<number, number>()
+  let peersWithoutProtocol = 0
+
+  /**
+   * 协议版本闸（规范 §5.2 V3；GAP-2）。
+   *
+   * 判定全部委托给协议层的 `negotiateProtocol` —— **中继不自己算版本区间**，
+   * 那正是这份改造要消掉的那类重复（同一个数在两处各写一遍，改一处不改另一处）。
+   *
+   * 为什么值得加：改造之前 `hello.protocol` **从未被读过**，实测一份
+   * `protocol: 999` 的 hello 会照常握手成功。于是版本不兼容的现场表现是
+   * "连上了、界面正常、什么都不发生"——没有一层会报错，日志里也什么都没有。
+   * 把"不兼容"变成一句明说，是这一闸的全部价值。
+   *
+   * @param peerProtocol 非 `hello` 帧用 `peer` 上记下的那一次（`hello` 只发一次，
+   *   之后的帧都靠 peer 记着 —— 不记的话 `ping` 之类会因为"没带版本"而被当 1 处理，
+   *   那与对端真实版本无关，是一种更难查的错配）。
+   * @returns true = 放行
+   */
+  function acceptProtocol(peer: Peer, peerProtocol: unknown): boolean {
+    const verdict = negotiateProtocol(peerProtocol)
+    if (verdict.ok) {
+      if (verdict.missing) peer.protocolMissing = true
+      return true
+    }
+    // 显式带 message：此刻 `peer.role` 还没设（hello 走这条闸时），所以
+    // `CLIENT_ERROR_TEXT` 那张**客户端**表在这里取不到 —— 依赖它就会发出一个空 message，
+    // 而客户端的处理是 `f.message || f.code` ⇒ 用户看到一句英文码。
+    sendToPeer(peer, makeErrorFrame('unsupported_protocol', verdict.message))
+    log.info('handshake rejected', { reason: verdict.reason, peer: String(verdict.peer).slice(0, 16) })
+    // 用 1002（协议错误）而不是默认的 1000：这一条**不是**正常关闭，
+    // 而是"我们说不了话"。客户端本来也不会因为它报未连接（它只认 hello-ok）。
+    peer.ws.close(1002, 'unsupported_protocol')
+    return false
+  }
 
   function handleFrame(peer: Peer, frame: EndpointFrame): void {
     switch (frame.t) {
       case 'hello':
+        // ⚠️ **协议版本闸在这里，不在 `handleHello` 里**（2026-10-07 补，GAP-2）。
+        //
+        // 实证（`tests/handshake.test.mjs` 里那条）：改造之前，发一份
+        // `hello{protocol: 999}` 会**照常收到 `hello-ok`** —— 中继从头到尾没读过
+        // `hello.protocol`。而这正是 `negotiate.ts` 文件头说的"最贵的一类故障"：
+        // 版本不兼容表现为"连上了、界面正常、什么都不发生"，没有任何一层会报错。
+        //
+        // 为什么放在 `handleFrame` 的最前面、而不是 `handleHello` 里：
+        // ① **它是所有帧的入口**，不止 `hello` —— 一条不带 `hello` 就发业务帧的连接
+        //    （未认证却已通过帧闸）在旧实现里会一路走到分流深处才炸，错误信息还更难懂；
+        // ② 它**先于** `peer.role` 被设置，所以这一段里 `sendError` 的角色分支
+        //    拿不到 role —— 下面显式带 message，正是为了不依赖那张表（见那里的注释）。
+        // ③ `negotiateProtocol(undefined)` 按 1 处理并放行（V1：老端点不发这个字段），
+        //    所以**这一闸对现有的小程序与插件零影响** —— 判据里钉了这条。
+        if (!acceptProtocol(peer, frame.t === 'hello' ? frame.protocol : peer.protocol)) return
         return handleHello(peer, frame)
       case 'pair-begin':
         return handlePairBegin(peer, frame)
@@ -740,7 +866,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       case 'ping':
         return sendToPeer(peer, pongFrameOf(frame.ts))
       default:
-        return sendError(peer, 'unknown_frame', String((frame as { t?: string }).t))
+        return sendError(peer, 'unknown_frame', String((frame as { t?: string }).t), String((frame as { t?: string }).t))
     }
   }
 
@@ -865,10 +991,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
           return
         }
         if (!KNOWN_FRAME_NAMES.has(name)) {
-          sendError(peer, 'unknown_frame', name)
+          sendError(peer, 'unknown_frame', name, name)
           return
         }
-        sendError(peer, 'bad_frame', `frame "${name}" has an invalid shape`)
+        // 帧名同时给 host（英文细节）与用户（`userHint`）："是哪条帧坏了"两边都用得上，
+        // 而英文那句只给 host（见 sendError 的注释）。
+        sendError(peer, 'bad_frame', `frame "${name}" has an invalid shape`, name)
         return
       }
       if ((frame.t === 'enc' || frame.t === 'enc-batch') && !ciphertextsAreBase64(frame)) {
@@ -887,6 +1015,14 @@ export function createRelay(config: RelayConfig): RelayHandle {
     })
     ws.on('close', () => {
       peers.delete(ws)
+      // 协议版本观测面同步减一（见 peerProtocols 的注释：为什么是计数而不是 Set）。
+      // 顺序要紧：先减、后判是否归零删键 —— 反过来会漏掉"最后一个对端断开"这个状态。
+      if (peer.protocol === undefined) peersWithoutProtocol = Math.max(0, peersWithoutProtocol - 1)
+      else {
+        const left = (peerProtocols.get(peer.protocol) ?? 1) - 1
+        if (left > 0) peerProtocols.set(peer.protocol, left)
+        else peerProtocols.delete(peer.protocol)
+      }
       // 必须从桶里摘掉：Set 不摘就永远留着这条 Peer，ping 会继续朝一个已关闭的
       // socket 发（terminate 过的 ws 再 ping 是抛错被吞掉的），而且 maxConnections
       // 是按 wss.clients 算的，桶这边就会和闸门慢慢对不上。
@@ -1069,6 +1205,16 @@ export function createRelay(config: RelayConfig): RelayHandle {
       stateWriteFailures: persistence.failures,
       lastPingAgo: lastPingAt === 0 ? -1 : Math.round((Date.now() - lastPingAt) / 1000),
       shuttingDown,
+      // 协议版本协商的观测面（2026-10-07）。有了版本闸之后，"为什么这个对端连不上"
+      // 就成了新的排障问题，而没有这一项时它只能去翻日志。
+      //
+      // 报的是**对端报的最小/最大版本**与"没报过版本"的连接数，两个方向缺一不可：
+      // 只报最大值的话，一个全是老小程序的环境看起来与新版本一样正常。
+      protocolSelf: PROTOCOL_VERSION,
+      protocolMin: MIN_SUPPORTED_PROTOCOL,
+      peerProtocolMin: peerProtocols.size === 0 ? -1 : Math.min(...peerProtocols.keys()),
+      peerProtocolMax: peerProtocols.size === 0 ? -1 : Math.max(...peerProtocols.keys()),
+      peersNoProtocol: peersWithoutProtocol,
     }
   }
 

@@ -12,6 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import { createRelay } from '../dist/src/server.js'
 import { loadConfig } from '../dist/src/config.js'
 
@@ -118,3 +119,149 @@ test('/healthz 的每一个字段都在文档的表里（新增字段不许只�
     assert.ok(README.includes(key), `README 的端点表没提到 ${key}`)
   }
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 错误码中文文案：协议层的每个 ErrorCode 都必须有一句中文（2026-10-07）
+//
+// ## 为什么这是判据而不是一次补字
+//
+// `CLIENT_ERROR_TEXT` 是**手抄**的 `Partial<Record<ErrorCode, string>>` ——
+// "Partial" 意味着**漏一个编译期不报错**。而漏掉的后果正好落在最需要它的人身上：
+// `unsupported_protocol`（协议版本对不上）触发时，用户看到的是
+// 客户端那句 `f.message || f.code` 里的**英文码**，40 字宽的 toast，
+// 既看不懂也不知道下一步该做什么（升级谁？重扫？换中继？）。
+//
+// 这与"文档漂了"是同一族，但更硬：文档错了运维能发现，手机上弹一句英文没人能查。
+// 所以做成**双向**判据：协议层加一个码 → 这张表必须补；这张表多一个码 → 协议层必须有它。
+// 双向的意义是让两种错都变红（单向的话，加码不补文案仍然全绿）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 只可能发给 **host** 的错误码 —— 它们**不该**出现在客户端文案表里。
+ *
+ * 判据是"调用点前面有角色守卫"，逐条核实过（这是这张表**刻意不全**的依据，
+ * 而不是"漏了几个"的借口）。往里加这些码会让那张表看起来覆盖了全部而实际不是。
+ */
+const HOST_ONLY_CODES = ['bad_role', 'bad_token', 'need_host', 'bad_pair']
+
+test('只可能发给 host 的错误码不会出现在客户端文案表里（那张表只管人会看到的）', () => {
+  const table = CLIENT_ERROR_TEXT_OF(SERVER)
+  const leaked = HOST_ONLY_CODES.filter((c) => table[c])
+  assert.deepEqual(
+    leaked,
+    [],
+    `这些码只发给主机插件（调用点前面有 ${HOST_ONLY_CODES.join('/')} 的角色守卫），` +
+      '却写进了客户端文案表：会让那张表看起来"每个码都有中文"而实际不是。',
+  )
+})
+
+test('每个"人会看到"的错误码都有一句中文文案（漏一个编译期不报错）', () => {
+  // `Partial<Record<ErrorCode, string>>` 里的 Partial 意味着**漏一个编译期不报错**。
+  // 而漏掉的后果正好落在最需要它的人身上：`unsupported_protocol`（协议版本对不上）
+  // 触发时，用户看到的是客户端那句 `f.message || f.code` 里的**英文码**——
+  // 既看不懂也不知道下一步该做什么（升级谁？重扫？换中继？）。
+  //
+  // 这与"文档漂了"是同一族但更硬：文档错了运维能发现，手机上弹一句英文没人能查。
+  const { errorCodes } = wireFrames()
+  const table = CLIENT_ERROR_TEXT_OF(SERVER)
+  // 集合来自**协议层的事实**减去"只发给 host 的"，而不是手抄一份清单 ——
+  // 手抄的话协议层加一个码，这��条判据仍会绿（那正是它要防的那种失效）。
+  const missing = errorCodes.filter((code) => !HOST_ONLY_CODES.includes(code) && !table[code])
+  assert.deepEqual(
+    missing,
+    [],
+    `这些错误码没有中文文案：${missing.join(', ')}。用户在手机上会看到英文码——` +
+      '既看不懂也不知道下一步做什么。而 `CLIENT_ERROR_TEXT` 的类型是 Partial，漏一个编译期不报错。',
+  )
+})
+
+test('CLIENT_ERROR_TEXT 里没有协议层不存在的码（反向：多写一个同样是漂移）', () => {
+  const { errorCodes } = wireFrames()
+  const table = CLIENT_ERROR_TEXT_OF(SERVER)
+  const extra = Object.keys(table).filter((code) => !errorCodes.includes(code))
+  assert.deepEqual(
+    extra,
+    [],
+    `这张表里有协议层不存在的码：${extra.join(', ')}。它永远不会被触发，` +
+      '而"看起来有覆盖"会让人以为这一类已经处理过了。',
+  )
+})
+
+test('每句文案都真的是中文（不能是英文码或空串充数）', () => {
+  const table = CLIENT_ERROR_TEXT_OF(SERVER)
+  for (const [code, text] of Object.entries(table)) {
+    assert.ok(
+      typeof text === 'string' && text.trim().length > 0,
+      `${code} 的文案是空的 —— 空串与缺项在客户端表现一样（都回落到英文码）`,
+    )
+    // 至少要有一个 CJK 字符；纯 ASCII 的串在这一族里通常是"抄了 key 忘了填"
+    assert.match(text, /[\u4e00-\u9fff]/, `${code} 的文案没有中文：${JSON.stringify(text)}`)
+  }
+})
+
+test('错误码 → 文案 → 实际发出的帧，三者一致（钉住"文案真的到得了手机"）', () => {
+  // 前两条验的是"表里有"，这条验的是"表真的被用上了"。
+  //
+  // 口径在 2026-10-07 变过一次，值得记下来：原判据钉的是
+  //   `message ?? (peer?.role === 'client' ? CLIENT_ERROR_TEXT[code] : undefined)`
+  // 即"显式传入的 message 优先"。那是**错的口径**——客户端的处理是
+  // `f.message || f.code`，所以中继随手传一句英文技术细节
+  // （`frame "hello" has an invalid shape`）就会**顶掉**整张中文表，
+  // 用户在手机上看到的是一句英文。
+  //
+  // 改成"client 一律中文、host 才拿细节"之后，上面那条正则就红了 ——
+  // 这正是判据该有的反应：它逼我把口径想清楚，而不是让实现迁就一条过时断言。
+  // 现在钉的是**两件事**：① 中文表对非 host 角色无条件生效；
+  // ② 技术细节走日志而不是帧（`log.debug('frame rejected', …)`）。
+  const picksChineseForNonHost = /const toClient = peer\?\.role !== 'host'/.test(SERVER)
+  assert.ok(
+    picksChineseForNonHost,
+    "sendError 里取文案的判据变了 —— 这条钉的是「非 host 角色一律拿中文表那句」" +
+      '（hello 之前 role 还是 unknown，用 === "client" 判会漏成英文，那是修过的缺陷）。' +
+      '改动之前先确认新的分支也满足上面那两条。',
+  )
+  assert.match(
+    SERVER,
+    /log\.debug\('frame rejected'/,
+    '技术细节没有落到日志里 —— 分流之后 host 侧与日志都拿不到原文，那条坏帧就真的没人能查了',
+  )
+  // 反向：host 侧必须仍然拿得到细节（插件日志与 status.json 排障靠它）
+  assert.match(
+    SERVER,
+    /const base = toClient \? CLIENT_ERROR_TEXT\[code\] : message/,
+    'host 侧不再收到技术细节了 —— 分流的另一半丢了（细节要留给排障，不是全丢掉）',
+  )
+  // 帧名两边都要给：它对排障有用，对用户也有用（判断"是不是我版本太老"）。
+  // 走 userHint 而不是 message —— 后者是英文技术细节，会顶掉中文表。
+  assert.match(
+    SERVER,
+    /const text = toClient && userHint \? `\$\{base \?\? ''\}（\$\{userHint\}）` : base/,
+    'userHint 没有被拼进客户端文案 —— "是哪条帧坏了"对用户也是有用信息，不该只留在日志里',
+  )
+})
+
+/** 从真实产物里取协议层的 errorCodes（不是 src —— 测 src 测的是另一个东西）。 */
+let _wire
+function wireFrames() {
+  if (!_wire) _wire = createRequire(new URL('../dist/src/server.js', import.meta.url).pathname)('dsh-remote-wire/frames')
+  return _wire
+}
+
+/**
+ * 从 `src/server.ts` 里把 `CLIENT_ERROR_TEXT` 那张表**抠出来**。
+ *
+ * 为什么读源码而不 import：`CLIENT_ERROR_TEXT` 是模块内的局部 const，没有导出
+ * （而导出它只为测试会改变生产模块的面—— 那是另一种取舍）。
+ * 抠文本 + 逐条断言，比 import 更能容忍重构（表挪个位置都不必改判据），
+ * 而且它测的正是"这张表还写着什么"。
+ */
+function CLIENT_ERROR_TEXT_OF(src) {
+  const start = src.indexOf('CLIENT_ERROR_TEXT')
+  assert.notEqual(start, -1, 'src/server.ts 里找不到 CLIENT_ERROR_TEXT')
+  const open = src.indexOf('{', start)
+  const close = src.indexOf('}', open)
+  const body = src.slice(open + 1, close)
+  const out = {}
+  for (const m of body.matchAll(/(\w+)\s*:\s*'([^']*)'/g)) out[m[1]] = m[2]
+  return out
+}
