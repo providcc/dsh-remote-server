@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-server",
-  "version": "2.0.15",
+  "version": "2.0.16",
   "private": true,
   "description": "Zero-knowledge WebSocket relay for DSH Remote Control. Routes sealed records between the host plugin and paired clients; never sees plaintext.",
   "type": "module",
@@ -40,7 +40,7 @@
   "devDependencies": {
     "@types/node": "^26.6.3",
     "@types/ws": "^8.5.12",
-    "dsh-remote-wire": "1.0.0-rc.1",
+    "dsh-remote-wire": "2.0.16",
     "esbuild": "^0.28.2",
     "prettier": "^3.3.3",
     "typescript": "^7.0.2",
