@@ -266,10 +266,7 @@ export class RelayState implements Clock {
    * `unknown_session`，从而拿到中文的"请重新配对"提示。
    * 不这么做的后果是永久静默：中继表命中、主机解不开、手机没有任何反馈。
    */
-  resync(
-    hostId: string,
-    sessionIds: readonly string[],
-  ): { kept: number; dropped: string[]; emptyAtRisk: number } {
+  resync(hostId: string, sessionIds: readonly string[]): { kept: number; dropped: string[]; emptyAtRisk: number } {
     const claimed = new Set(sessionIds)
     const dropped: string[] = []
     let kept = 0

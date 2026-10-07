@@ -4,10 +4,11 @@
 
 ## 当前部署
 
+| 形态     | **Docker**（`deploy/docker/compose.yaml`；2026-10-07 从 systemd 切过来，nginx 不动）   |
 | 项       | 值                                                                                     |
 | -------- | -------------------------------------------------------------------------------------- |
 | 公网入口 | `wss://drc.provid.cc`                                                                  |
-| 中继     | `/opt/dsh-remote-control/server/relay.mjs`（**一个自包含单文件**），systemd 单元 `dsh-remote-control.service` |
+| 中继     | 镜像 `dsh-remote-relay`（里面是**一个自包含单文件**），compose 服务 `relay`。systemd 单元 `dsh-remote-control.service` 仍保留可用，**二选一** |
 | 反向代理 | nginx，`/etc/nginx/conf.d/drc.conf`                                                    |
 | 证书     | Let's Encrypt（acme.sh + 阿里云 DNS-01），ECC，自动续期                                 |
 | 绑定     | 中继只监听 `127.0.0.1:8787`，公网只暴露 80/443                                          |
@@ -29,7 +30,12 @@ dnf install -y nodejs nginx           # Alibaba Cloud Linux 4 自带 node 22
 mkdir -p /opt/dsh-remote-control/server /etc/nginx/ssl
 ```
 
-### 2. 部署中继
+### 2. 部署中继（Docker）
+
+> 生产现在跑的是容器，完整步骤在 [`docker/README.md`](docker/README.md)（含镜像源拉不到时的三条路）。 下面这份是**裸机 systemd** 那条路，仍然可用，但两条**别同时开**——同一个端口只能有一个进程在听。
+
+#### 2b. 裸机 systemd
+
 
 ```sh
 # 本地先构建产物

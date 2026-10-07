@@ -38,7 +38,17 @@
  *
  * 本文件不 import `ws`、不 import `server.ts`，可以纯内存单测。
  */
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 import { CONVERSATION_ID_PREFIX } from 'dsh-remote-wire/ids'
 import type { Log } from './log.js'

@@ -57,7 +57,7 @@ DRC_HOST_TOKEN=$(openssl rand -hex 32) DRC_PORT=8787 node dist/bundle/main.js
 
 ```sh
 curl -s http://127.0.0.1:8787/healthz
-# {"ok":true,"version":"1.0.6","uptimeSec":1,"hosts":0,"clients":0,"conversations":0,"pendingPairs":0,"shuttingDown":false}
+# {"ok":true,"version":"2.0.15","uptimeSec":4,"hosts":1,"clients":0,"conversations":1,"pendingPairs":0,"droppedFrames":0,"slowConsumers":0,"rejectedPairs":0,"shutdownForced":0,"persistence":"on","stateRestored":1,"stateSavedAtSec":4,"stateWrites":12,"stateWriteFailures":0,"lastPingAgo":1,"shuttingDown":false}
 
 curl -s http://127.0.0.1:8787/api/info
 # {"publicUrl":"","protocol":1}
@@ -112,18 +112,39 @@ DRC_HOST_TOKEN=smoke-token-0123456789abcdef DRC_PORT=0 node relay.mjs
 
 ## 部署
 
-两条路，产物是同一个文件：**GitHub Release 上挂的那一个 `.mjs`**（scp + systemd，
-见 `deploy/`）与**从源码构建**。生产上现在跑的是第一条。本仓不发 npm（原因见顶部）。
+产物是**一个文件**（`dist/bundle/main.js`，`ws`/协议层全内联、运行时零依赖），怎么托管它有三条路：
+
+| 形态       | 怎么跑                                                          | 用在哪                       |
+| ---------- | --------------------------------------------------------------- | ---------------------------- |
+| **Docker** | `docker compose -f deploy/docker/compose.yaml up -d --build`    | **生产实例现在跑的就是这条** |
+| systemd    | `install -m0755` 那个 `.mjs` + `systemctl start`                | 不装 Docker 的机器           |
+| 单文件     | GitHub Release 上挂的那一个 `.mjs`，`node relay.mjs` 就算起来了 | 临时验证                     |
+
+三条路**同形**：同一个产物、同一套 `DRC_*`、同一个 `/healthz`；变的只有「谁负责把它拉起来」。
+本仓不发 npm（原因见顶部）。
 
 `deploy/` 里是**正在生产使用**的配置，不是示例：
 
+- `deploy/docker/` —— Dockerfile + compose + 容器化部署指南（含镜像源拉不到时的三条路）
 - `deploy/nginx/drc.conf` —— 反向代理（TLS 终止 + 按 IP 限流 + WS 升级）
-- `deploy/systemd/dsh-remote-control.service` —— Linux 常驻单元
+- `deploy/systemd/dsh-remote-control.service` —— Linux 常驻单元（与容器二选一）
 - `deploy/README.md` —— 从零复现步骤
 
 中继**不终止 TLS**。小程序真机只允许 `wss://`，所以公网部署必须有反向代理。
-完整指南（环境变量全表、日志契约、重启语义、journald 过滤、systemd/launchd/Docker、
+完整指南（环境变量全表、日志契约、重启语义、journald 与 docker logs 过滤、systemd/launchd/Docker、
 升级回滚）见 [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md)。
+
+### 命令行
+
+```sh
+node relay.mjs              # 启动（读 DRC_*；缺 DRC_HOST_TOKEN 拒绝启动）
+node relay.mjs --version    # 打印版本号，exit 0，不监听端口、不需要 token
+node relay.mjs --help       # 用法
+```
+
+退出码：**0** 正常（含优雅停机）/ **1** 运行期致命 / **2** 命令行用法错。
+2 单独分出来是因为容器编排里传错 flag 的表现是「容器起来了但行为不是我要的」——
+旧行为是静默忽略任意参数。
 
 ## 开发
 

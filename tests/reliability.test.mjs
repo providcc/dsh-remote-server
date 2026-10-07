@@ -34,31 +34,31 @@ const MAIN = join(ROOT, 'dist', 'src', 'main.js')
 const TOKEN = 'reliability-host-token-0123456789ab'
 
 function tmpDir() {
-  return mkdtempSync(join(tmpdir(), 'drc-reliability-'));
+  return mkdtempSync(join(tmpdir(), 'drc-reliability-'))
 }
 async function captureStdout(fn) {
-  const lines = [];
-  const original = process.stdout.write;
+  const lines = []
+  const original = process.stdout.write
   process.stdout.write = (chunk) => {
-    lines.push(String(chunk));
-    return true;
-  };
-  try {
-    await fn();
-  } finally {
-    process.stdout.write = original;
+    lines.push(String(chunk))
+    return true
   }
-  return lines;
+  try {
+    await fn()
+  } finally {
+    process.stdout.write = original
+  }
+  return lines
 }
 
 function countLog(lines, msg) {
   return lines.filter((line) => {
     try {
-      return JSON.parse(line).msg === msg;
+      return JSON.parse(line).msg === msg
     } catch {
-      return false;
+      return false
     }
-  }).length;
+  }).length
 }
 
 async function startRelay(env = {}) {
@@ -519,9 +519,20 @@ test('E3：写出来的状态文件仍然完整、可读、且没有残留临时
     const path = join(dir, 'state.json')
     const { log } = captureLog()
     const state = stateWith([{ conversationId: 'c_0000000000aa', clients: ['a'], lastActivityAt: 5 }])
-    assert.equal(writeStateFile(path, { version: STATE_FILE_VERSION, savedAt: 5, conversations: [
-      { conversationId: 'c_0000000000aa', hostId: 'h1', clients: ['a'], seqHost: 0, lastActivityAt: 5 },
-    ] }, log), true)
+    assert.equal(
+      writeStateFile(
+        path,
+        {
+          version: STATE_FILE_VERSION,
+          savedAt: 5,
+          conversations: [
+            { conversationId: 'c_0000000000aa', hostId: 'h1', clients: ['a'], seqHost: 0, lastActivityAt: 5 },
+          ],
+        },
+        log,
+      ),
+      true,
+    )
     const parsed = JSON.parse(readFileSync(path, 'utf8'))
     assert.equal(parsed.conversations.length, 1)
     assert.equal(parsed.conversations[0].conversationId, 'c_0000000000aa')

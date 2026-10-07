@@ -85,11 +85,11 @@ scp deploy/systemd/dsh-remote-control.service root@HOST:/etc/systemd/system/
 | `DRC_HOST_GRACE_MS`           |      | `120000`（120 秒）  | 毫秒   | 主机 socket 断开后多久才通知客户端"主机已离开"。没有它，一次网络抖动就会让手机丢掉配对                                                                                                                                                                                                   |
 | `DRC_SWEEP_MS`                |      | `5000`              | 毫秒   | **表清扫**周期：过期配对码清理、慢消费者判定、host 宽限期到期、会话空闲回收、空会话回收五件事挂在它上面。**保活 ping 不在这里**（见下面两行）；调小只为排错（e2e 用 `1000`）                                                                                                             |
 | `DRC_COUNTERS_LOG_MS`         |      | `60000`（60 秒）    | 毫秒   | 把 `/healthz` 那组计数器按周期抄进日志（`msg:"counters"`）。`droppedFrames` 这类是**自启动累计**、进程一换就归零，不抄进日志就没法回答"昨天那段时间丢了多少"                                                                                                                             |
-| `DRC_PING_INTERVAL_MS`        | ✅   | `60000`（60 秒）    | 毫秒   | 一条连接两次被 ping 之间的目标间隔。**代价**：静默死掉（无 FIN/RST）的半开对端要约 **2 倍**这个时间才被回收，槽位回收变慢就在这里调小                                                                                                                                                    |
-| `DRC_PING_TICK_MS`            | ✅   | `1000`              | 毫秒   | ping 轮转步长，每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。桶数 = 两者的商（默认 60 桶）                                                                                                                                                                               |
+| `DRC_PING_INTERVAL_MS`        |      | `60000`（60 秒）    | 毫秒   | 一条连接两次被 ping 之间的目标间隔。**代价**：静默死掉（无 FIN/RST）的半开对端要约 **2 倍**这个时间才被回收，槽位回收变慢就在这里调小                                                                                                                                                    |
+| `DRC_PING_TICK_MS`            |      | `1000`              | 毫秒   | ping 轮转步长，每 tick 只 ping `pingIntervalMs / pingTickMs` 分之一的那一桶。桶数 = 两者的商（默认 60 桶）                                                                                                                                                                               |
 | `DRC_MAX_BUFFERED_BYTES`      |      | `1048576`（1 MiB）  | 字节   | 慢消费者阈值：对端发送缓冲区**连续**超限达到**本角色的窗口**才 1008 `slow_consumer` 断开（主机 `DRC_SLOW_CONSUMER_HOST_MS` 10 秒 / 客户端 `DRC_SLOW_CONSUMER_CLIENT_MS` 45 秒），而不是无限堆积把中继内存吃掉。判定由 `DRC_SWEEP_MS` 那一轮**定时驱动**——静默的慢对端同样会被评估        |
-| `DRC_SLOW_CONSUMER_HOST_MS`   | ✅   | `10000`（10 秒）    | 毫秒   | **主机**侧慢消费者窗口。窗口短：主机卡住就是所有人卡住，没有"断开即重连"的对端行为要迁就                                                                                                                                                                                                 |
-| `DRC_SLOW_CONSUMER_CLIENT_MS` | ✅   | `45000`（45 秒）    | 毫秒   | **客户端**侧慢消费者窗口。**必须大于对端自己的重连周期**（小程序 `CONNECT_TIMEOUT_MS` 12s + `RECONNECT_MAX_MS` 30s + 抖动 ≈ 42.5s → 取 45s）：窗口落进周期内，手机每次刚回来就又被踢，会形成永不升级的 ~11s 重连循环（`tests/limits.test.mjs` 直接读对端源码的常量锁这条）。调小只为测试 |
+| `DRC_SLOW_CONSUMER_HOST_MS`   |      | `10000`（10 秒）    | 毫秒   | **主机**侧慢消费者窗口。窗口短：主机卡住就是所有人卡住，没有"断开即重连"的对端行为要迁就                                                                                                                                                                                                 |
+| `DRC_SLOW_CONSUMER_CLIENT_MS` |      | `45000`（45 秒）    | 毫秒   | **客户端**侧慢消费者窗口。**必须大于对端自己的重连周期**（小程序 `CONNECT_TIMEOUT_MS` 12s + `RECONNECT_MAX_MS` 30s + 抖动 ≈ 42.5s → 取 45s）：窗口落进周期内，手机每次刚回来就又被踢，会形成永不升级的 ~11s 重连循环（`tests/limits.test.mjs` 直接读对端源码的常量锁这条）。调小只为测试 |
 | `DRC_PAIR_STATUS`             |      | 关闭                | —      | 设为 `1` **或** `true` 才启用 `/api/pair-status`（默认关闭，见下）                                                                                                                                                                                                                       |
 | `DRC_PAIR_STATUS_PER_SEC`     |      | `5`                 | 次/秒  | `/api/pair-status` 的配额（只在上面那条开启时生效）。这是一条**无认证**的"这个 6 位码在不在"判定接口，10⁶ 的码空间不设配额就是一台免费枚举机；超配额回 `429` 并记 `pair-status budget exhausted`。真正的边界仍应由反代限流兜住                                                           |
 | `DRC_STATE_FILE`              |      | 空（关闭）          | 路径   | 会话表落盘路径。**默认关闭 = 纯内存模式**（与 1.0.6 之前逐字一致，重启丢配对）。标准生产值 `DRC_STATE_FILE=/var/lib/dsh-remote-control/state.json`；相对路径按进程 cwd 解析，systemd 下就是单元的 `WorkingDirectory`                                                                     |
@@ -169,7 +169,7 @@ DRC_HOST_TOKEN=$(openssl rand -hex 32) DRC_PORT=8787 node dist/bundle/main.js
 
 ```sh
 curl -s http://127.0.0.1:8787/healthz
-# {"ok":true,"version":"1.0.6","uptimeSec":1,"hosts":0,"clients":0,"conversations":0,"pendingPairs":0,"shuttingDown":false}
+# {"ok":true,"version":"2.0.15","uptimeSec":4,"hosts":1,"clients":0,"conversations":1,"pendingPairs":0,"droppedFrames":0,"slowConsumers":0,"rejectedPairs":0,"shutdownForced":0,"persistence":"on","stateRestored":1,"stateSavedAtSec":4,"stateWrites":12,"stateWriteFailures":0,"lastPingAgo":1,"shuttingDown":false}
 curl -s http://127.0.0.1:8787/api/info
 # {"publicUrl":"","protocol":1}
 curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8787/api/pair-status?token=123456'
@@ -214,7 +214,7 @@ curl -s http://127.0.0.1:8787/healthz
 | `stateWrites`        | number | ✅ 契约      | 累计：本进程成功写盘次数（只增不减）                                                                                                                                                                |
 | `stateWriteFailures` | number | ✅ 契约      | 累计：本进程写盘失败次数（只增不减，写失败只记日志不致命）                                                                                                                                          |
 | `lastPingAgo`        | number | ✅ 契约      | **秒**。距上一次保活 ping 扫描多久；`-1` = 还没扫过。单位是秒不是毫秒，看指标时别按 ms 判                                                                                                           |
-| `shutdownForced`     | number | ✅ 契约      | 累计：5 秒兜底强退的次数（正常排空恒 0，只增不减）。**兜底与排空成功同为 exit(0)**，退出码分不出这两种停机，这是唯一能事后分辨的出口                                                                |
+| `shutdownForced`     | number | ✅ 契约      | 累计：5 秒兜底强退的次数。**注意它结构上永远读到 0**（加一之后紧接着就是 `exit(0)`，没人来得及 curl）——要分辨"排空 vs 强退"请看 §9.1 的那两行 warn 日志                                             |
 | `shuttingDown`       | bool   | ✅ 契约      | 收到 SIGTERM/SIGINT 后置位                                                                                                                                                                          |
 
 这 18 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
@@ -315,33 +315,33 @@ node scripts/loadtest-conns.mjs --n=10000 --seconds=30
 
 ### 5.1 值得盯的行
 
-| `msg`                                                                    | `level`  | 含义 / 该怎么反应                                                                                                                                                                                              |
-| ------------------------------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `relay listening`                                                        | info     | 启动成功。`port`/`bind`/`version` 三个字段就是"线上到底是哪版、在听哪个地址"的答案                                                                                                                             |
-| `host auth failed`                                                       | warn     | 有端点拿错 token 在试。**同一连接连续 5 次会 4001 断开，但断开这一步没有独立的告警行**——只有 `attempts` 一路涨到 5 然后连接消失。看到 `attempts:4` 就该怀疑 token 漂移                                         |
-| `frame flood disconnected`                                               | warn     | 单连接帧速率违规累计 3 次，已 1008 断开                                                                                                                                                                        |
-| `pair budget exhausted (global)`                                         | warn     | **全局配对配额打满**（`DRC_PAIR_GLOBAL_PER_SEC`）。字段里的 `reason:"rate_limited"` 是我们的真实原因，见 §5.2                                                                                                  |
-| `pair-status budget exhausted`                                           | warn     | `/api/pair-status` 的配额打满（`DRC_PAIR_STATUS_PER_SEC`），该请求已回 **429**。注意到它说明有人在对 6 位码空间做枚举                                                                                          |
-| `http request failed` / `http client error` / `websocket upgrade failed` | warn     | HTTP 面的畸形请求（含畸形 `Host`、坏请求行）。**只记日志、只回 400/500，进程不受影响**——这三条连同固定 URL base 就是本轮修掉的那个未认证 DoS                                                                   |
-| `pair failed`                                                            | **info** | 配对码错。**这一行是 info 级**，字段 `attemptsLeft` 递减到 0 时该连接被 4008 断开——而断开本身没有 warn 行。只盯 `-p warning` 会漏掉配对码爆破                                                                  |
-| `heartbeat timeout`                                                      | warn     | 对端上一轮 WS 层 ping 没回 pong，已 `terminate()`                                                                                                                                                              |
-| `slow consumer disconnected`                                             | warn     | 缓冲区**连续**超 `DRC_MAX_BUFFERED_BYTES` 达**本角色的窗口**（主机 `DRC_SLOW_CONSUMER_HOST_MS` 10 秒 / 客户端 `DRC_SLOW_CONSUMER_CLIENT_MS` 45 秒），1008 `slow_consumer` 断开。字段 `buffered` 是当时的字节数 |
-| `pair table full`                                                        | warn     | 待配对表打满（`DRC_MAX_PENDING_PAIRS`）                                                                                                                                                                        |
-| `enc from non-member`                                                    | warn     | 有非会话成员往某条通道灌密文（拒绝）。可能是抢注，也可能是主机重连后的孤儿 socket                                                                                                                              |
-| `client replaced by newer socket`                                        | warn     | 同 `clientId` 的旧连接被顶掉。同一台手机反复出现说明它在掉线重连                                                                                                                                               |
-| `socket error` / `send failed`                                           | warn     | 底层 socket 异常，多数是网络抖动，成串出现才值得查                                                                                                                                                             |
-| `frame handler threw`                                                    | error    | 处理某一帧时抛异常，已回 `error{internal}`。带 `t` 字段，说明是哪类帧                                                                                                                                          |
-| `uncaught exception` / `unhandled rejection`                             | error    | 进程随即 **exit 1**，交给 `Restart=always` 拉起                                                                                                                                                                |
-| `shutting down`                                                          | info     | 收到 SIGTERM/SIGINT。`signal` 字段告诉你来源                                                                                                                                                                   |
-| `shutdown timed out, forcing exit`                                       | warn     | 5 秒没排干净，强退（退出码仍是 0）。偶发无妨，频繁出现说明有连接卡在 draining。紧跟着的 `shutdown forced` 会补写一次状态文件，并把这次强退记进 `/healthz` 的 `shutdownForced`                                  |
-| `host offline (grace started)`                                           | info     | 主机 socket 掉了，宽限期 `DRC_HOST_GRACE_MS` 开始计时。**这条不该当告警用**：主机自己会重连                                                                                                                    |
-| `host grace expired`                                                     | info     | 宽限期到点仍没回来，已向该主机的所有客户端发 `peer-left`。手机上会提示重新配对                                                                                                                                 |
-| `host online` / `client online` / `paired`                               | info     | 正常流水。`paired` 给出 `sessionId`/`hostId`/`clientId` 三元组，是"这台手机连的是这台主机"的唯一权威记录                                                                                                       |
-| `pair token issued`                                                      | info     | 主机发布了一张码，字段 `token:"<redacted>"`。**info 级不落完整配对码**。要看到真正的码得开 `debug`                                                                                                             |
-| `conversation voided by host` / `conversations dropped at host resync`   | info     | 主机自己声明某条会话它不再持有密钥，或 `resync` 时没被列出而被删掉                                                                                                                                             |
-| `conversation idle-dropped`                                              | info     | 空闲超过 `DRC_CONV_IDLE_TTL_MS` 被回收。客户端下次发帧会撞上 `unknown_session`                                                                                                                                 |
-| `conversation empty-dropped`                                             | info     | 最后一个客户端离开后空过 `DRC_CONV_EMPTY_TTL_MS` 被回收。**socket 断开不起这个表**（护 D3 免扫码），只有 `leave`/重新配对摘清成员才起                                                                          |
-| `pair tokens expired`                                                    | debug    | 清扫周期清掉的过期/已用码条数                                                                                                                                                                                  |
+| `msg`                                                                    | `level`  | 含义 / 该怎么反应                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `relay listening`                                                        | info     | 启动成功。`port`/`bind`/`version` 三个字段就是"线上到底是哪版、在听哪个地址"的答案                                                                                                                                                          |
+| `host auth failed`                                                       | warn     | 有端点拿错 token 在试。**同一连接连续 5 次会 4001 断开，但断开这一步没有独立的告警行**——只有 `attempts` 一路涨到 5 然后连接消失。看到 `attempts:4` 就该怀疑 token 漂移                                                                      |
+| `frame flood disconnected`                                               | warn     | 单连接帧速率违规累计 3 次，已 1008 断开                                                                                                                                                                                                     |
+| `pair budget exhausted (global)`                                         | warn     | **全局配对配额打满**（`DRC_PAIR_GLOBAL_PER_SEC`）。字段里的 `reason:"rate_limited"` 是我们的真实原因，见 §5.2                                                                                                                               |
+| `pair-status budget exhausted`                                           | warn     | `/api/pair-status` 的配额打满（`DRC_PAIR_STATUS_PER_SEC`），该请求已回 **429**。注意到它说明有人在对 6 位码空间做枚举                                                                                                                       |
+| `http request failed` / `http client error` / `websocket upgrade failed` | warn     | HTTP 面的畸形请求（含畸形 `Host`、坏请求行）。**只记日志、只回 400/500，进程不受影响**——这三条连同固定 URL base 就是本轮修掉的那个未认证 DoS                                                                                                |
+| `pair failed`                                                            | **info** | 配对码错。**这一行是 info 级**，字段 `attemptsLeft` 递减到 0 时该连接被 4008 断开——而断开本身没有 warn 行。只盯 `-p warning` 会漏掉配对码爆破                                                                                               |
+| `heartbeat timeout`                                                      | warn     | 对端上一轮 WS 层 ping 没回 pong，已 `terminate()`                                                                                                                                                                                           |
+| `slow consumer disconnected`                                             | warn     | 缓冲区**连续**超 `DRC_MAX_BUFFERED_BYTES` 达**本角色的窗口**（主机 `DRC_SLOW_CONSUMER_HOST_MS` 10 秒 / 客户端 `DRC_SLOW_CONSUMER_CLIENT_MS` 45 秒），1008 `slow_consumer` 断开。字段 `buffered` 是当时的字节数                              |
+| `pair table full`                                                        | warn     | 待配对表打满（`DRC_MAX_PENDING_PAIRS`）                                                                                                                                                                                                     |
+| `enc from non-member`                                                    | warn     | 有非会话成员往某条通道灌密文（拒绝）。可能是抢注，也可能是主机重连后的孤儿 socket                                                                                                                                                           |
+| `client replaced by newer socket`                                        | warn     | 同 `clientId` 的旧连接被顶掉。同一台手机反复出现说明它在掉线重连                                                                                                                                                                            |
+| `socket error` / `send failed`                                           | warn     | 底层 socket 异常，多数是网络抖动，成串出现才值得查                                                                                                                                                                                          |
+| `frame handler threw`                                                    | error    | 处理某一帧时抛异常，已回 `error{internal}`。带 `t` 字段，说明是哪类帧                                                                                                                                                                       |
+| `uncaught exception` / `unhandled rejection`                             | error    | 进程随即 **exit 1**，交给 `Restart=always` 拉起                                                                                                                                                                                             |
+| `shutting down`                                                          | info     | 收到 SIGTERM/SIGINT。`signal` 字段告诉你来源                                                                                                                                                                                                |
+| `shutdown timed out, forcing exit`                                       | warn     | 5 秒没排干净，强退（退出码仍是 0）。偶发无妨，频繁出现说明有连接卡在 draining（2.x 起对端 1.5 秒不关就会被 `terminate()`，所以频繁出现要查是谁不回应关闭握手）。紧跟着的 `shutdown forced` 会补写一次状态文件，并带出 `shutdownForced` 计数 |
+| `host offline (grace started)`                                           | info     | 主机 socket 掉了，宽限期 `DRC_HOST_GRACE_MS` 开始计时。**这条不该当告警用**：主机自己会重连                                                                                                                                                 |
+| `host grace expired`                                                     | info     | 宽限期到点仍没回来，已向该主机的所有客户端发 `peer-left`。手机上会提示重新配对                                                                                                                                                              |
+| `host online` / `client online` / `paired`                               | info     | 正常流水。`paired` 给出 `sessionId`/`hostId`/`clientId` 三元组，是"这台手机连的是这台主机"的唯一权威记录                                                                                                                                    |
+| `pair token issued`                                                      | info     | 主机发布了一张码，字段 `token:"<redacted>"`。**info 级不落完整配对码**。要看到真正的码得开 `debug`                                                                                                                                          |
+| `conversation voided by host` / `conversations dropped at host resync`   | info     | 主机自己声明某条会话它不再持有密钥，或 `resync` 时没被列出而被删掉                                                                                                                                                                          |
+| `conversation idle-dropped`                                              | info     | 空闲超过 `DRC_CONV_IDLE_TTL_MS` 被回收。客户端下次发帧会撞上 `unknown_session`                                                                                                                                                              |
+| `conversation empty-dropped`                                             | info     | 最后一个客户端离开后空过 `DRC_CONV_EMPTY_TTL_MS` 被回收。**socket 断开不起这个表**（护 D3 免扫码），只有 `leave`/重新配对摘清成员才起                                                                                                       |
+| `pair tokens expired`                                                    | debug    | 清扫周期清掉的过期/已用码条数                                                                                                                                                                                                               |
 
 ### 5.2 限速时"线上说法"与"日志说法"不一致（必须知道）
 
@@ -609,37 +609,27 @@ launchctl load ~/Library/LaunchAgents/com.dsh.remote-control.plist
 
 常驻退化成"一个文件、一条命令、没有依赖安装步骤"。 **[未实测]**
 
-### 8.3 Docker
+### 8.3 Docker（生产用的就是这一份）
 
-仓库里**没有** Dockerfile（生产是裸 systemd + nginx），下面这份按当前产物形态自己存一份，
-例如 `deploy/Dockerfile`：
+仓库里**有** Dockerfile 与 compose：`deploy/docker/`。形态与裸机 systemd **同形**——
+同一个单文件产物、同一套 `DRC_*`、同一个 `/healthz`；变的只有「谁负责把它拉起来」。
 
-```dockerfile
-FROM node:22-slim
-WORKDIR /app
-# 只有一个文件要拷，没有 package.json、没有 npm install
-COPY dist/bundle/main.js /app/relay.mjs
-ENV DRC_PORT=8787
-# 容器自己就是边缘：默认绑定是 127.0.0.1，不覆盖的话 -p 发布出来的端口没人监听
-ENV DRC_BIND=0.0.0.0
-EXPOSE 8787
-CMD ["node", "/app/relay.mjs"]
-```
+完整步骤、镜像源受限时的三条路、切回 systemd 的步骤，都在
+[`../deploy/docker/README.md`](../deploy/docker/README.md)。这里只写三件**必须自己记住**的事：
 
-```sh
-pnpm build
-docker build -f deploy/Dockerfile -t dsh-rc-relay .
-docker run -d --name drc -p 8787:8787 \
-  -e DRC_HOST_TOKEN=$(openssl rand -hex 32) \
-  -e DRC_PUBLIC_URL=wss://drc.example.com \
-  dsh-rc-relay
-```
+| 项           | 值                                         | 不这么做会怎样                                                                                                                                                 |
+| ------------ | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DRC_BIND`   | 镜像里已经是 `0.0.0.0`，compose 里显式写死 | 容器内绑 `127.0.0.1` → `-p` 发布成功但**外面连不上**                                                                                                           |
+| 端口发布     | `127.0.0.1:8787:8787`（只到回环）          | 绑 `0.0.0.0:8787` → 8787 直接暴露公网，绕过 nginx 的按 IP 限流                                                                                                 |
+| `/data` 属主 | `10001:10001`                              | 状态写不进去。**2.x 起启动那一刻就会记一条 `state file is not writable` 的 error**；1.x 时代只能等每 60 秒一条的 `state file write failed`，而配对表面完全正常 |
 
-**`DRC_BIND=0.0.0.0` 这条不能省**（代码默认只绑回环；照抄一个没写它的示例会起来一个
-端口发布成功但外面连不上的容器）。若只在本机跑反代再转发进容器，可以用
-`--network host` 或把发布改成 `127.0.0.1:8787:8787` 并保持默认绑定。 **[未实测]**
+第三条是容器化给 §0.1 那个老坑**新增的一个成因**（忘了挂卷、属主不对）。
+默认用具名卷就是为了绕开它：Docker 用镜像里 `/data` 的属主初始化具名卷，于是
+`docker compose up` 开箱即用。生产为了落在 `/var/lib` 下改用宿主机路径，那就得 chown。
 
----
+**nginx 一行都不用改**：端口只发布到宿主机回环，`/etc/nginx/conf.d/drc.conf` 的
+`proxy_pass http://127.0.0.1:8787` 原样继续工作，TLS 仍由 nginx 终止。
+换 systemd 与换容器**别同时开**（同一个端口只能有一个进程在听）。
 
 ## 9. 优雅停机与暴露面
 
@@ -647,12 +637,42 @@ docker run -d --name drc -p 8787:8787 \
 
 1. 置 `shuttingDown`：新 WebSocket 连接直接 1013 `server_shutdown`，HTTP upgrade 回 503；
 2. 停止清扫定时器；
-3. 给所有已连接 socket 发 `1001 server_shutdown`；
+3. 给所有已连接 socket 发 `1001 server_shutdown`，然后**等对端走完关闭握手**，
+   最多 1.5 秒（`DRAIN_MS`）；仍未走的直接 `terminate()`。
 4. 关闭 HTTP 监听，等它的 `close` 回调 → **exit 0**；5 秒没走完就强退，**仍是 exit 0**。
 
+第 3 条那 1.5 秒不是锦上添花（2026-10-07 补）。**升级过的 WebSocket socket 由对端决定何时
+消失**：手机进电梯、切 4G、主机休眠时它既不发 FIN 也不回关闭帧，于是 `http.close()` 的回调
+**永不触发**，每一次这样的停机都走满 5 秒兜底。反过来，空闲的 keep-alive **HTTP** 连接**不阻塞**
+`close()`（Node ≥19 自己关）——所以"被拖住"的只有 WS 侧，这也解释了为什么改造前它只在有手机
+连着的时候出现。兜底 `terminate()` 之后，TCP 层直接断、状态随之收敛。
+
+顺带修好一句**名不副实的注释**："排空之后再写一次盘"。旧写法里那次写盘发生在
+`http.close()` 的回调里，而那与 ws 的 `close` 回调谁先跑取决于 Node 内部的监听器注册序——
+多数时候成立、偶尔不成立。现在 `drain()` 保证所有 close 回调都跑完再写。
+
 未捕获异常（`uncaughtException` 事件）与未处理的 rejection 走另一条路：记一行 error 日志后
-**exit 1**，把重启交给 `Restart=always`——无值守进程里"活着但坏了"比"死了被拉起来"更糟。 **[已验证：
-`tests/hardening.test.mjs` 断言对端收到 1001 且进程 exit 0；`tests/bundle.test.mjs` 断言产物 SIGTERM exit 0]**
+**exit 1**，把重启交给 `Restart=always` / `restart: unless-stopped`——无值守进程里"活着但坏了"
+比"死了被拉起来"更糟。 **[已验证：`tests/hardening.test.mjs` 断言对端收到 1001 且进程 exit 0；
+`tests/bundle.test.mjs` 断言产物 SIGTERM exit 0]**
+
+### 9.1 `/healthz` 的停机语义与 `shutdownForced` 的真相
+
+**停机中 `/healthz` 回 503**（2026-10-07 改）。改造前无论 `ok` 是 true 还是 false 都回 200，
+于是任何只看状态码的观测面（Docker HEALTHCHECK、负载均衡器、k8s probe、`curl --fail`）
+都会在**正在关闭**的进程上读到 200，继续往一个不再接受 upgrade 的实例上送流量。
+状态码本来就是这件事的表达方式；`ok` 字段留给人去读。
+
+**`shutdownForced` 这个字段结构上永远是 0**，请不要拿它当判据（2026-10-07 订正）。
+它只在 `forceShutdown()` 里加一，而那个函数紧接着就是 `process.exit(0)`——没人来得及 curl。
+真正能事后分辨"排空成功 vs 强退"的出口是**那两行日志**：
+
+```
+{"msg":"shutdown timed out, forcing exit","level":"warn"}
+{"msg":"shutdown forced","level":"warn","shutdownForced":1}
+```
+
+告警规则应当基于这两行，不是基于 `/healthz`。
 
 暴露面：
 

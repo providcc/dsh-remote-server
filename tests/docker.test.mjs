@@ -72,7 +72,11 @@ test('Dockerfile：DRC_BIND 被显式设成 0.0.0.0（容器自己就是边缘�
   // 这条在 SELF-HOSTING.md 里被单独警告过一次，是最容易在复制粘贴中丢掉的一行。
   const env = /^ENV .*$/m.exec(DOCKERFILE)?.[0] ?? ''
   assert.match(env, /DRC_BIND=0\.0\.0\.0/, `ENV 行里必须有 DRC_BIND=0.0.0.0，实际：${env}`)
-  assert.doesNotMatch(env, /DRC_STATE_FILE/, '镜像里**故意不设** DRC_STATE_FILE：落盘路径属于部署形态，与卷由 compose 配')
+  assert.doesNotMatch(
+    env,
+    /DRC_STATE_FILE/,
+    '镜像里**故意不设** DRC_STATE_FILE：落盘路径属于部署形态，与卷由 compose 配',
+  )
 })
 
 test('Dockerfile：STOPSIGNAL 与 ENTRYPOINT 的形状', () => {
@@ -99,7 +103,11 @@ test('compose：落盘路径与卷是一对，且默认用具名卷', () => {
   const volume = /^\s*- \$\{DRC_DATA_DIR(?::-[^}]+)?\}:\/data$/m.exec(COMPOSE)?.[0] ?? ''
   assert.match(stateFile, /\/data\/state\.json/, `DRC_STATE_FILE 要落在挂载点上，实际：${stateFile}`)
   assert.ok(volume, '必须挂 /data')
-  assert.match(COMPOSE, /^volumes:\n\s+relay-data:/m, '要有具名卷 relay-data：Docker 用镜像里 /data 的属主初始化它，开箱即用')
+  assert.match(
+    COMPOSE,
+    /^volumes:\n\s+relay-data:/m,
+    '要有具名卷 relay-data：Docker 用镜像里 /data 的属主初始化它，开箱即用',
+  )
   assert.match(volume, /:-relay-data\}/, 'DRC_DATA_DIR 的默认值必须是那个具名卷，而不是 ./data（后者属主由宿主机决定）')
 })
 
@@ -114,12 +122,20 @@ test('compose：加固项与 systemd 单元取同一个口径', () => {
   ]) {
     assert.match(COMPOSE, pattern, `compose 缺 ${pattern} —— ${why}`)
   }
-  assert.match(COMPOSE, /restart: unless-stopped/, '崩溃即拉起；但**不是** always：优雅停机 exit 0 之后 always 会把它再拉起来')
+  assert.match(
+    COMPOSE,
+    /restart: unless-stopped/,
+    '崩溃即拉起；但**不是** always：优雅停机 exit 0 之后 always 会把它再拉起来',
+  )
   assert.doesNotMatch(COMPOSE, /restart: always/, 'always 是错的（"停机之后进程自己回来了"）')
 })
 
 test('compose：缺 token 时在启动前就报错', () => {
-  assert.match(COMPOSE, /DRC_HOST_TOKEN: \$\{DRC_HOST_TOKEN:\?/, '用 :? 让 compose 自己拒绝，而不是让容器起来再拒绝（那时报错在 logs 里）')
+  assert.match(
+    COMPOSE,
+    /DRC_HOST_TOKEN: \$\{DRC_HOST_TOKEN:\?/,
+    '用 :? 让 compose 自己拒绝，而不是让容器起来再拒绝（那时报错在 logs 里）',
+  )
 })
 
 test('.dockerignore：裁掉该裁的，留住构建要用的', () => {
@@ -129,7 +145,11 @@ test('.dockerignore：裁掉该裁的，留住构建要用的', () => {
   // 这两个漏了就会构建失败或把构建搞慢，所以要在判据里点名。
   assert.doesNotMatch(IGNORE, /^scripts$/m, 'scripts/ 要留着：打包那一步在里面')
   assert.doesNotMatch(IGNORE, /^src$/m, 'src/ 要留着')
-  assert.doesNotMatch(IGNORE, /^deploy$/m, 'deploy/ 不走 context（Dockerfile 用 -f 指定），裁掉它是可以的，但别在这里裁')
+  assert.doesNotMatch(
+    IGNORE,
+    /^deploy$/m,
+    'deploy/ 不走 context（Dockerfile 用 -f 指定），裁掉它是可以的，但别在这里裁',
+  )
 })
 
 test('docker compose config 在装了 compose 的机器上真的成立（没装就跳过，不假装通过）', async (t) => {
