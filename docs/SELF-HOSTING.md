@@ -216,11 +216,11 @@ curl -s http://127.0.0.1:8787/healthz
 | `lastPingAgo`        | number | ✅ 契约      | **秒**。距上一次保活 ping 扫描多久；`-1` = 还没扫过。单位是秒不是毫秒，看指标时别按 ms 判                                                                                                           |
 | `shutdownForced`     | number | ✅ 契约      | 累计：5 秒兜底强退的次数。**注意它结构上永远读到 0**（加一之后紧接着就是 `exit(0)`，没人来得及 curl）——要分辨"排空 vs 强退"请看 §9.1 的那两行 warn 日志                                             |
 | `shuttingDown`       | bool   | ✅ 契约      | 收到 SIGTERM/SIGINT 后置位                                                                                                                                                                          |
-| `protocolSelf`      | number | ✅ 契约      | 本中继实现的协议版本（= `PROTOCOL_VERSION`）。收到超出 `[protocolMin, protocolSelf]` 的 `hello` 会被拒（`unsupported_protocol`）                                                  |
-| `protocolMin`       | number | ✅ 契约      | 本中继能接受的**最低**对端协议版本。低于它按"太旧"拒；**等于 1** 时表示任何现存版本都能连（加性演进）                                                                                            |
-| `peerProtocolMin`   | number | ✅ 契约      | 当前已连上对端报的**最小**协议版本；`-1` = 现在没有对端。**这一项是排查"某个客户端连不上"的第一站**                                                                                              |
-| `peerProtocolMax`   | number | ✅ 契约      | 当前已连上对端报的**最大**协议版本；`-1` = 现在没有对端。出现比 `protocolSelf` 更大的值说明有对端在说本中继听不懂的版本（那一次握手就会被拒，所以它不该出现在这里）                        |
-| `peersNoProtocol`   | number | ✅ 契约      | 已连上但**没报**协议版本的对端数（规范 V1 的老端点，例如旧版本小程序）。它们**照常放行**——这个数只是观测，不是错误                                                                              |
+| `protocolSelf`       | number | ✅ 契约      | 本中继实现的协议版本（= `PROTOCOL_VERSION`）。收到超出 `[protocolMin, protocolSelf]` 的 `hello` 会被拒（`unsupported_protocol`）                                                                    |
+| `protocolMin`        | number | ✅ 契约      | 本中继能接受的**最低**对端协议版本。低于它按"太旧"拒；**等于 1** 时表示任何现存版本都能连（加性演进）                                                                                               |
+| `peerProtocolMin`    | number | ✅ 契约      | 当前已连上对端报的**最小**协议版本；`-1` = 现在没有对端。**这一项是排查"某个客户端连不上"的第一站**                                                                                                 |
+| `peerProtocolMax`    | number | ✅ 契约      | 当前已连上对端报的**最大**协议版本；`-1` = 现在没有对端。出现比 `protocolSelf` 更大的值说明有对端在说本中继听不懂的版本（那一次握手就会被拒，所以它不该出现在这里）                                 |
+| `peersNoProtocol`    | number | ✅ 契约      | 已连上但**没报**协议版本的对端数（规范 V1 的老端点，例如旧版本小程序）。它们**照常放行**——这个数只是观测，不是错误                                                                                  |
 
 这 23 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
 `rejectedPairs`/`shutdownForced`/`stateWrites`/`stateWriteFailures` 是**累计计数**（只增不减），混在一起会让"手机不更新"这类排查分不清

@@ -274,7 +274,12 @@ export class RelayState implements Clock {
   resync(
     hostId: string,
     sessionIds: readonly string[],
-  ): { kept: number; dropped: string[]; droppedMembers: Array<{ conversationId: string; clientIds: string[] }>; emptyAtRisk: number } {
+  ): {
+    kept: number
+    dropped: string[]
+    droppedMembers: Array<{ conversationId: string; clientIds: string[] }>
+    emptyAtRisk: number
+  } {
     const claimed = new Set(sessionIds)
     const dropped: string[] = []
     const droppedMembers: Array<{ conversationId: string; clientIds: string[] }> = []

@@ -140,7 +140,11 @@ test('老端点照常连上：不报 protocol（V1）与报 1 都必须放行', 
 test('比本端新的协议版本被拒，且给的是一句中文（会原样弹到手机上）', async () => {
   const { relay, url } = await startRelay()
   try {
-    const r = await sayHello(url, { t: 'hello', role: 'client', clientId: 'future', protocol: 999 }, { waitClose: true })
+    const r = await sayHello(
+      url,
+      { t: 'hello', role: 'client', clientId: 'future', protocol: 999 },
+      { waitClose: true },
+    )
     assert.equal(r.frames[0]?.t, 'error', `应当拒这条握手，实际 ${JSON.stringify(r.frames)}`)
     assert.equal(r.frames[0]?.code, 'unsupported_protocol', `错误码不对：${JSON.stringify(r.frames[0])}`)
     // 关键：客户端的处理是 `f.message || f.code`，所以**没有 message 就等于把英文码弹给用户**

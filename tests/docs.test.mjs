@@ -216,7 +216,7 @@ test('错误码 → 文案 → 实际发出的帧，三者一致（钉住"文案
   const picksChineseForNonHost = /const toClient = peer\?\.role !== 'host'/.test(SERVER)
   assert.ok(
     picksChineseForNonHost,
-    "sendError 里取文案的判据变了 —— 这条钉的是「非 host 角色一律拿中文表那句」" +
+    'sendError 里取文案的判据变了 —— 这条钉的是「非 host 角色一律拿中文表那句」' +
       '（hello 之前 role 还是 unknown，用 === "client" 判会漏成英文，那是修过的缺陷）。' +
       '改动之前先确认新的分支也满足上面那两条。',
   )
@@ -243,7 +243,8 @@ test('错误码 → 文案 → 实际发出的帧，三者一致（钉住"文案
 /** 从真实产物里取协议层的 errorCodes（不是 src —— 测 src 测的是另一个东西）。 */
 let _wire
 function wireFrames() {
-  if (!_wire) _wire = createRequire(new URL('../dist/src/server.js', import.meta.url).pathname)('dsh-remote-wire/frames')
+  if (!_wire)
+    _wire = createRequire(new URL('../dist/src/server.js', import.meta.url).pathname)('dsh-remote-wire/frames')
   return _wire
 }
 

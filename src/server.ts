@@ -19,11 +19,7 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { WebSocketServer, WebSocket, type RawData } from 'ws'
-import {
-  type EndpointFrame,
-  type ErrorCode,
-  type RelayFrame,
-} from 'dsh-remote-wire/frames'
+import { type EndpointFrame, type ErrorCode, type RelayFrame } from 'dsh-remote-wire/frames'
 import { newHostId } from 'dsh-remote-wire/ids'
 import { negotiateProtocol, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION } from 'dsh-remote-wire/negotiate'
 import { wantsRetryAfter } from 'dsh-remote-wire/errors'
@@ -290,10 +286,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
   // 变成"进程起不来"，而 `main.ts` 只能报一句 fatal。
   // 取值与 config.ts 相同（1024），两处的一致由 `config.test.mjs` 那条判据守住。
   const MAX_PING_BUCKETS = 1024
-  const pingBucketCount = Math.min(
-    MAX_PING_BUCKETS,
-    Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs)),
-  )
+  const pingBucketCount = Math.min(MAX_PING_BUCKETS, Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs)))
   const pingBuckets: Array<Set<Peer>> = Array.from({ length: pingBucketCount }, () => new Set<Peer>())
   let nextPingBucket = 0
   let currentPingBucket = 0
@@ -373,7 +366,13 @@ export function createRelay(config: RelayConfig): RelayHandle {
     internal: '中继内部错误',
   }
 
-  function sendError(peer: Peer | undefined, code: ErrorCode, message?: string, userHint?: string, retryAfterMs?: number): void {
+  function sendError(
+    peer: Peer | undefined,
+    code: ErrorCode,
+    message?: string,
+    userHint?: string,
+    retryAfterMs?: number,
+  ): void {
     // ⚠️ **`message` 只给 host 角色**（2026-10-07 审计补）。它是**技术细节**
     // （`frame "enc" has an invalid shape`、`ciphertext must be standard base64`），
     // 而客户端的处理是 `f.message || f.code` —— 一旦把英文原文发给手机，
@@ -963,7 +962,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
       case 'ping':
         return sendToPeer(peer, pongFrameOf(frame.ts))
       default:
-        return sendError(peer, 'unknown_frame', String((frame as { t?: string }).t), String((frame as { t?: string }).t))
+        return sendError(
+          peer,
+          'unknown_frame',
+          String((frame as { t?: string }).t),
+          String((frame as { t?: string }).t),
+        )
     }
   }
 
@@ -1105,12 +1109,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
           case 'bad_frame':
             // "名字对、形状坏"。帧名同时给 host（英文细节）与用户（`userHint`）：
             // "是哪条帧坏了"两边都用得上，而英文那句只给 host（见 sendError 的注释）。
-            sendError(
-              peer,
-              'bad_frame',
-              `frame "${verdict.frameType}" has an invalid shape`,
-              verdict.frameType,
-            )
+            sendError(peer, 'bad_frame', `frame "${verdict.frameType}" has an invalid shape`, verdict.frameType)
             return
           case 'not_object':
           case 'no_frame_type':

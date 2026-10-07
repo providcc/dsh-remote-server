@@ -433,7 +433,10 @@ test('leaveAll 把 clientId 从所有会话摘掉，并给空的那几条打上 
   assert.equal(state.conversations.get(conv1).clients.size, 0)
   assert.equal(state.conversations.get(conv3).clients.size, 1, '别人的会话里只摘自己')
   // ⚠️ 这一条才是本缺陷的要害：空会话必须**打上计时**，否则回收判据看不见它。
-  assert.ok(state.conversations.get(conv1).emptySince !== undefined, '成员表空了却不打 emptySince：那条会话再也等不到回收')
+  assert.ok(
+    state.conversations.get(conv1).emptySince !== undefined,
+    '成员表空了却不打 emptySince：那条会话再也等不到回收',
+  )
   assert.equal(
     state.conversations.get(conv3).emptySince,
     undefined,

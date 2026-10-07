@@ -122,10 +122,7 @@ test('反向判据：极端 interval 也不许让 loadConfig 变成"0 条 proble
   // `Array.from({length})` 直接抛 RangeError，而异常发生在 createRelay 里，
   // 早就跑完了 loadConfig —— 所以"配置校验通过"与"能启动"是两件事。
   const { problems } = load({ DRC_PING_TICK_MS: '1', DRC_PING_INTERVAL_MS: '9007199254740991' })
-  assert.ok(
-    problems.length > 0,
-    '这么离谱的一组值必须至少报一条诊断：0 条 problem 意味着"配置检查通过"，而它随后会崩',
-  )
+  assert.ok(problems.length > 0, '这么离谱的一组值必须至少报一条诊断：0 条 problem 意味着"配置检查通过"，而它随后会崩')
   assert.ok(
     problems.some((p) => p.level === 'error' || p.level === 'warn'),
     '必须落在 error 或 warn 上，不能是 info（info 没人看）',
@@ -137,11 +134,7 @@ test('反向判据：正常量级不许被这条新判据误伤（默认就该�
   const buckets = Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs))
   assert.ok(buckets >= 2 && buckets <= 1024, `默认 ${buckets} 个桶：上下界都要留得住它`)
   const bucketProblems = problems.filter((p) => /ping 桶|桶数/.test(p.message))
-  assert.equal(
-    bucketProblems.length,
-    0,
-    `默认配置不该报桶数相关诊断，实际报了：${JSON.stringify(bucketProblems)}`,
-  )
+  assert.equal(bucketProblems.length, 0, `默认配置不该报桶数相关诊断，实际报了：${JSON.stringify(bucketProblems)}`)
 })
 
 test('端口也只认十进制字面量（`integer()` 那条纪律不许在 portNumber 上漏网）', () => {

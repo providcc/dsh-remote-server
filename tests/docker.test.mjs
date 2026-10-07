@@ -178,8 +178,7 @@ test('指南：镜像加速那条路必须说清"合并 daemon.json"与"核对 d
   assert.doesNotMatch(
     DOCKERFILE,
     /1ms\.run|1ms\.cloud/,
-    'Dockerfile 的 FROM 里出现了具体镜像站域名：可达性该由环境（daemon.json）解决，' +
-      '而不是把供应链交给那个域名',
+    'Dockerfile 的 FROM 里出现了具体镜像站域名：可达性该由环境（daemon.json）解决，' + '而不是把供应链交给那个域名',
   )
 })
 

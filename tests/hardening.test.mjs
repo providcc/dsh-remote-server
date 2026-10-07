@@ -175,7 +175,10 @@ test('帧洪泛：先回一次 rate_limited，持续违规则 1008 断开', asyn
     // 帧闸是固定 1 秒窗口，所以这个数落在 (0, 1000]。
     for (const frame of reported) {
       assert.equal(Number.isInteger(frame.retryAfterMs), true, `retryAfterMs 必须是正整数，收到 ${frame.retryAfterMs}`)
-      assert.ok(frame.retryAfterMs > 0 && frame.retryAfterMs <= 1000, `retryAfterMs 超出 1 秒窗口：${frame.retryAfterMs}`)
+      assert.ok(
+        frame.retryAfterMs > 0 && frame.retryAfterMs <= 1000,
+        `retryAfterMs 超出 1 秒窗口：${frame.retryAfterMs}`,
+      )
     }
   } finally {
     await server.kill()

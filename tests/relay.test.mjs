@@ -1246,7 +1246,9 @@ test('/api/info 的 protocol 必须**引用** PROTOCOL_VERSION（判据只能查
   // 换成查源码之后，同一个变异会让它变红。代价是它只覆盖这一个文件的这几行
   // —— 但这已经比"一个恒绿的断言"好得多，而后者是这个项目里更常见的形状。
   const src = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8')
-  const line = src.split('\n').find((l) => l.includes("pathname === '/api/info'") || l.includes('publicUrl: config.publicUrl'))
+  const line = src
+    .split('\n')
+    .find((l) => l.includes("pathname === '/api/info'") || l.includes('publicUrl: config.publicUrl'))
   assert.ok(line, '定位不到 /api/info 那行：判据本身失效了（它会静默放过一切）')
   // 找到真正拼 JSON 的那一行（下一行），断言它带常量名
   const lines = src.split('\n')
@@ -1259,10 +1261,7 @@ test('/api/info 的 protocol 必须**引用** PROTOCOL_VERSION（判据只能查
     '必须引用 PROTOCOL_VERSION：这条是**无认证**接口，而小程序拿它判"能不能连"，' +
       '写死的版本号在协议升版时会静默变成一句谎话',
   )
-  assert.ok(
-    !/protocol: 1\b/.test(body),
-    '不许写回字面量 1（变异验证证明：行为判据抓不住它，只有查源码能）',
-  )
+  assert.ok(!/protocol: 1\b/.test(body), '不许写回字面量 1（变异验证证明：行为判据抓不住它，只有查源码能）')
 })
 
 test('转发的 enc 帧带 clientId，且 seq 原样透传（协议层 encToRelay 的接线）', async () => {
@@ -1291,10 +1290,7 @@ test('防御纵深：绕过 loadConfig 直接构造 config 时，ping 桶数仍�
   //
   // 所以 server.ts 里必须**自己也夹一道**，取值与 config.ts 相同。
   // 这条判据直接照那个形状造一份 config，不经过 loadConfig。
-  const { config } = loadConfig(
-    { ...process.env, DRC_HOST_TOKEN: TOKEN, DRC_PORT: '0', DRC_BIND: '127.0.0.1' },
-    'test',
-  )
+  const { config } = loadConfig({ ...process.env, DRC_HOST_TOKEN: TOKEN, DRC_PORT: '0', DRC_BIND: '127.0.0.1' }, 'test')
   config.pingTickMs = 1
   config.pingIntervalMs = Number.MAX_SAFE_INTEGER
   const relay = createRelay(config)
@@ -1449,10 +1445,7 @@ test('re-hello 换身份：旧 clientId 必须从会话成员表里摘掉（否�
       `成员表里还留着 ${[...conv.clients].join(',')}：旧 clientId 已经不会回来了，` +
         '而它让 markEmpty 永远不打点 ⇒ sweepEmpty（30 分钟回收空会话）完全失效',
     )
-    assert.ok(
-      conv.emptySince !== undefined,
-      '空会话必须打上回收计时：这是 sweepEmpty 唯一的入口，不打点就等于永不过期',
-    )
+    assert.ok(conv.emptySince !== undefined, '空会话必须打上回收计时：这是 sweepEmpty 唯一的入口，不打点就等于永不过期')
     // 顺带确认主机侧**确实**收到了通知（那段注释承诺的动作本来就做了）
     const left = host.frames.filter((f) => f.t === 'peer-left')
     assert.ok(left.length >= 1, '主机必须收到 peer-left：换身份了，它不该再往旧手机发密文')
@@ -1520,17 +1513,16 @@ test('pair-fail 必须带上**是哪一张**码失败的（主机靠它避免作
   try {
     const { host, client } = await pairUp(ctx)
     // 主机手上有一张**有效**的码（123456，pairUp 发的）
-    assert.ok(host.frames.some((f) => f.t === 'pair-ready'), '夹具自检：主机手上有码')
+    assert.ok(
+      host.frames.some((f) => f.t === 'pair-ready'),
+      '夹具自检：主机手上有码',
+    )
 
     // 客户端报一张**根本不存在**的码
     client.send({ t: 'pair-begin-client', pairingToken: '999999' })
     const fail = await client.until((f) => f.t === 'pair-fail')
     assert.equal(fail.reason, 'invalid_or_expired')
-    assert.equal(
-      fail.pairingToken,
-      '999999',
-      '必须点名是哪一张失败的：主机靠它避免把「当前展示的那张」误当成废码',
-    )
+    assert.equal(fail.pairingToken, '999999', '必须点名是哪一张失败的：主机靠它避免把「当前展示的那张」误当成废码')
   } finally {
     await ctx.close()
   }
@@ -1552,11 +1544,7 @@ test('形状不合的 pair-begin-client：pair-fail **不带** token（不可信
     client.send({ t: 'pair-begin-client' }) // 缺 pairingToken
     const fail = await client.until((f) => f.t === 'pair-fail' || f.t === 'error')
     assert.equal(fail.t, 'pair-fail', '形状错仍然回 pair-fail 而不是 bad_frame（F6）')
-    assert.equal(
-      fail.pairingToken,
-      undefined,
-      '形状不合时那个 token 不可信，绝不能发给主机去作废一张码',
-    )
+    assert.equal(fail.pairingToken, undefined, '形状不合时那个 token 不可信，绝不能发给主机去作废一张码')
   } finally {
     await ctx.close()
   }
