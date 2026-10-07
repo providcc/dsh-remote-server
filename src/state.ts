@@ -262,13 +262,22 @@ export class RelayState implements Clock {
 
   /**
    * 主机重启后声明它还持有密钥的会话（复核 R1）。
-   * 没被列出的会话被删除，但**不通知客户端**——客户端下一次发帧会撞上
-   * `unknown_session`，从而拿到中文的"请重新配对"提示。
-   * 不这么做的后果是永久静默：中继表命中、主机解不开、手机没有任何反馈。
+   * 没被列出的会话被删除，并**把它的成员一起交回给调用方**（`droppedMembers`）——
+   * 调用方据此向那些客户端发 `peer-left`。
+   *
+   * 为什么必须通知（2026-10-07 修）：原来这一路**不发任何帧**，理由是"客户端下一次发帧
+   * 会撞上 `unknown_session`，照样拿到中文提示"。那条出口是真的，但它是**被动**的：
+   * 手机停在那里什么都不做时，屏幕上一切正常，而它其实已经连着一个没有钥匙的对端——
+   * 直到用户某一次点了发送，才在 12 秒后知道。同一个中继在另外两条路（主机宽限期到期、
+   * 主机显式 `session-leave`）都是**主动**通知的，只有这一条是哑的，那种不对称本身就是坑。
    */
-  resync(hostId: string, sessionIds: readonly string[]): { kept: number; dropped: string[]; emptyAtRisk: number } {
+  resync(
+    hostId: string,
+    sessionIds: readonly string[],
+  ): { kept: number; dropped: string[]; droppedMembers: Array<{ conversationId: string; clientIds: string[] }>; emptyAtRisk: number } {
     const claimed = new Set(sessionIds)
     const dropped: string[] = []
+    const droppedMembers: Array<{ conversationId: string; clientIds: string[] }> = []
     let kept = 0
     let emptyAtRisk = 0
     for (const [conversationId, conv] of [...this.conversations]) {
@@ -290,6 +299,9 @@ export class RelayState implements Clock {
         kept += 1
         continue
       }
+      // 成员名单要**在删之前**抄下来：删掉之后这张表就没人记得谁曾经挂在这条会话上了，
+      // 而那正是调用方发 `peer-left` 唯一需要的输入。
+      droppedMembers.push({ conversationId, clientIds: [...conv.clients] })
       this.conversations.delete(conversationId)
       dropped.push(conversationId)
     }
@@ -297,7 +309,7 @@ export class RelayState implements Clock {
     // 属于别的主机（或早已不存在）的 convId，旧写法 `claimed.size - dropped.length`
     // 会把它们一起算进去，日志里的 kept 于是比实际大——而这条日志正是运维判断
     // "主机还记得几条会话"的唯一出口。
-    return { kept, dropped, emptyAtRisk }
+    return { kept, dropped, droppedMembers, emptyAtRisk }
   }
 
   /** host→client 方向由中继编号；客户端从不读它（F13）。 */

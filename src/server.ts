@@ -28,6 +28,7 @@ import {
 } from 'dsh-remote-wire/frames'
 import { newHostId } from 'dsh-remote-wire/ids'
 import { negotiateProtocol, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION } from 'dsh-remote-wire/negotiate'
+import { wantsRetryAfter } from 'dsh-remote-wire/errors'
 import {
   encBatchToClient,
   encToClient,
@@ -143,15 +144,14 @@ interface Peer {
   /**
    * 对端在 `hello` 里报的协议版本（`undefined` = 没报，按 1 处理，V1）。
    *
-   * 为什么要在连接上记：版本闸在 `handleFrame` 最前面，而 `hello` 只发一次——
-   * 之后的 `enc` / `ping` / `session-leave` 若每次都靠帧上那个字段判断，
-   * 它们**根本没有**那个字段，于是每一条都会被当成"没报版本"按 1 处理。
-   * 那不是宽容，是**错配**：一个报 999 的主机发 `enc` 时会被当成 1 而放行，
-   * 版本闸只对它第一条 `hello` 有效——恰好等于没闸。
+   * ⚠️ 它**只喂 `/healthz` 的观测**（`peerProtocolMin` / `peerProtocolMax` /
+   * `peersNoProtocol`），**不参与任何判定**——决定"放不放行"的那一次判定发生在
+   * `hello` 上，见 `acceptProtocol` 的注释。
+   *
+   * 曾经这里写着"必须在连接上记，否则业务帧会被当成没报版本"——那是把**没发生的
+   * 事**写成了理由：业务帧从来不跑那道闸，所以不存在"被当成 1"这回事。
    */
   protocol?: number
-  /** 对端没报协议版本（V1 老端点）：只用于 `/healthz` 的观测，不参与判定。 */
-  protocolMissing?: boolean
 }
 
 export interface RelayHandle {
@@ -374,7 +374,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
     internal: '中继内部错误',
   }
 
-  function sendError(peer: Peer | undefined, code: ErrorCode, message?: string, userHint?: string): void {
+  function sendError(peer: Peer | undefined, code: ErrorCode, message?: string, userHint?: string, retryAfterMs?: number): void {
     // ⚠️ **`message` 只给 host 角色**（2026-10-07 审计补）。它是**技术细节**
     // （`frame "enc" has an invalid shape`、`ciphertext must be standard base64`），
     // 而客户端的处理是 `f.message || f.code` —— 一旦把英文原文发给手机，
@@ -405,7 +405,18 @@ export function createRelay(config: RelayConfig): RelayHandle {
     if (toClient && message) {
       log.debug('frame rejected', { code, detail: message.slice(0, 120) })
     }
-    sendToPeer(peer, makeErrorFrame(code, text))
+    /**
+     * `retryAfterMs` **只给"等一等就好"的码**（2026-10-07 接线，规范 §12.2 E2）。
+     *
+     * 判据委托协议层（`wantsRetryAfter`），不在这儿再写一张表：哪些码值得带等待提示
+     * 是**协议知识**，而"中继愿意等多久"是这边的事实——两者分开，谁都不会漂。
+     *
+     * 不带它的后果不是"少一个字段"：手机只能盲退避，而盲退避在"被拒 → 立刻重试 →
+     * 又被拒"的循环里等于没退（`errors.ts` 的注释把这条写得很清楚）。
+     * 反过来，给 `internal` 这种编不出等待时间的码硬塞一个数，比不带更糟——端点会**当真**。
+     */
+    const hint = wantsRetryAfter(code) ? retryAfterMs : undefined
+    sendToPeer(peer, makeErrorFrame(code, text, hint))
   }
 
   /**
@@ -747,10 +758,11 @@ export function createRelay(config: RelayConfig): RelayHandle {
    */
   function acceptProtocol(peer: Peer, peerProtocol: unknown): boolean {
     const verdict = negotiateProtocol(peerProtocol)
-    if (verdict.ok) {
-      if (verdict.missing) peer.protocolMissing = true
-      return true
-    }
+    // `verdict.missing`（V1 老端点没报版本）**不额外记账**：`peer.protocol === undefined`
+    // 本身就是那个事实，`/healthz` 的 `peersNoProtocol` 直接数它。曾经另有一个
+    // `peer.protocolMissing` 字段专门存它，但它**从来没有被读过**——同一件事的两份
+    // 记账迟早会分叉，而这一份连分叉都不会有人发现。
+    if (verdict.ok) return true
     // 显式带 message：此刻 `peer.role` 还没设（hello 走这条闸时），所以
     // `CLIENT_ERROR_TEXT` 那张**客户端**表在这里取不到 —— 依赖它就会发出一个空 message，
     // 而客户端的处理是 `f.message || f.code` ⇒ 用户看到一句英文码。
@@ -765,21 +777,25 @@ export function createRelay(config: RelayConfig): RelayHandle {
   function handleFrame(peer: Peer, frame: EndpointFrame): void {
     switch (frame.t) {
       case 'hello':
-        // ⚠️ **协议版本闸在这里，不在 `handleHello` 里**（2026-10-07 补，GAP-2）。
+        // ⚠️ **协议版本闸在这里**（2026-10-07 补，GAP-2），而它**只挡 `hello`**。
         //
         // 实证（`tests/handshake.test.mjs` 里那条）：改造之前，发一份
         // `hello{protocol: 999}` 会**照常收到 `hello-ok`** —— 中继从头到尾没读过
         // `hello.protocol`。而这正是 `negotiate.ts` 文件头说的"最贵的一类故障"：
         // 版本不兼容表现为"连上了、界面正常、什么都不发生"，没有任何一层会报错。
         //
-        // 为什么放在 `handleFrame` 的最前面、而不是 `handleHello` 里：
-        // ① **它是所有帧的入口**，不止 `hello` —— 一条不带 `hello` 就发业务帧的连接
-        //    （未认证却已通过帧闸）在旧实现里会一路走到分流深处才炸，错误信息还更难懂；
-        // ② 它**先于** `peer.role` 被设置，所以这一段里 `sendError` 的角色分支
-        //    拿不到 role —— 下面显式带 message，正是为了不依赖那张表（见那里的注释）。
-        // ③ `negotiateProtocol(undefined)` 按 1 处理并放行（V1：老端点不发这个字段），
-        //    所以**这一闸对现有的小程序与插件零影响** —— 判据里钉了这条。
-        if (!acceptProtocol(peer, frame.t === 'hello' ? frame.protocol : peer.protocol)) return
+        // 为什么放在 `case 'hello'` 里、而不是 `handleFrame` 最前面（2026-10-07 订正）：
+        // ① **只有 `hello` 带版本字段**，闸放在别处对业务帧毫无作用（`negotiateProtocol(undefined)`
+        //    按 1 放行）；
+        // ② 一个报 999 的对端**在 `hello` 这一刻就被拒并关掉**（1002），它的业务帧
+        //    根本没机会到达——所以"逐帧再判一次"是**多余的**，不是更严；
+        // ③ 反过来，把闸放到最前面会让**未认证**的连接拿到 `unsupported_protocol`
+        //    这种错误的码（它真正的问题是没握手），排错时指向错的方向。
+        // 这里曾经写着"它是所有帧的入口"——那句话描述的是一个**不存在**的行为。
+        //
+        // `peer.role` 在 hello 这一帧还没设，所以下面 `acceptProtocol` 显式带 message，
+        // 不依赖 `CLIENT_ERROR_TEXT` 那张按角色分流的表（见那里的注释）。
+        if (!acceptProtocol(peer, frame.protocol)) return
         return handleHello(peer, frame)
       case 'pair-begin':
         return handlePairBegin(peer, frame)
@@ -787,13 +803,39 @@ export function createRelay(config: RelayConfig): RelayHandle {
         return handlePairClaim(peer, frame)
       case 'resync': {
         // 复核 R1：主机(重)启动后声明它还持有密钥的会话。
-        // 没列出的会话直接删掉，**不发 peer-left**——客户端下次发帧会撞上
-        // unknown_session，从而得到中文的"会话已失效，请重新配对"提示。
+        // 没列出的会话直接删掉，**但必须告诉那些客户端**（2026-10-07 修，见下）。
         if (peer.role !== 'host' || !peer.hostId) {
           sendError(peer, 'need_host')
           return
         }
-        const { kept, dropped, emptyAtRisk } = state.resync(peer.hostId, frame.sessionIds)
+        const { kept, dropped, droppedMembers, emptyAtRisk } = state.resync(peer.hostId, frame.sessionIds)
+        /**
+         * 被删掉的会话要向它的成员发 `peer-left`——与主机宽限期到期（`sweep`）、
+         * 主机显式 `session-leave` 这两条路**同一个口径**。
+         *
+         * 原来这里不发，理由是"客户端下一次发帧会撞 `unknown_session`，照样能拿到中文提示"。
+         * 那条出口成立，但它是**被动**的：手机此刻停着不动，界面上一切正常，而它其实
+         * 连着一个已经没有钥匙的对端；直到用户某一次点了发送，才在 12 秒后知道。
+         * 三条路里只有这一条是哑的，而这条恰恰是主机**重启过**（最常见的那种）会走的。
+         *
+         * 用 `hostId` 而不是 `clientId` 作 peer-left 的第二个参数：这一路与
+         * `session-leave` 的主机分支一致——对手机来说语义都是"主机不要这条会话了"，
+         * 而它只按 `sessionId` 过滤（见 mp 的 `_onFrame`）。
+         */
+        for (const member of droppedMembers) {
+          for (const clientId of member.clientIds) {
+            sendTo(state.clients.get(clientId)?.ws, peerLeftFrame(member.conversationId, peer.hostId))
+          }
+        }
+        if (dropped.length > 0) {
+          const told = droppedMembers.reduce((sum, one) => sum + one.clientIds.length, 0)
+          log.info('conversations dropped at host resync', {
+            hostId: peer.hostId,
+            kept,
+            dropped: dropped.length,
+            clientsNotified: told,
+          })
+        }
         // resync 有三种后果，两种要进盘：
         // ① 删会话（dropped）—— 永久删除，不写就会在重启后被复活；
         // ② 给空会话保证回收计时（emptyAtRisk）—— HANDOFF 0.10.5 第 4 条修过的那条：
@@ -812,9 +854,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
         } else if (emptyAtRisk > 0 && now - lastResyncPersistAt >= RESYNC_PERSIST_MIN_GAP_MS) {
           lastResyncPersistAt = now
           markStateChanged()
-        }
-        if (dropped.length > 0) {
-          log.info('conversations dropped at host resync', { hostId: peer.hostId, kept, dropped: dropped.length })
         }
         return
       }
@@ -924,9 +963,16 @@ export function createRelay(config: RelayConfig): RelayHandle {
     peers.set(ws, peer)
     bucketAt(peer.pingBucket).add(peer)
     ws.on('message', (raw: RawData, isBinary: boolean) => {
-      const verdict = peer.rate.check(Date.now())
+      const now = Date.now()
+      const verdict = peer.rate.check(now)
       if (!verdict.allowed) {
-        if (verdict.shouldReport) sendError(peer, 'rate_limited')
+        // 帧闸是**固定 1 秒窗口**（见 FrameRateGate），所以"还要等多久"就是这一秒的余量。
+        // 带一个具体的数（而不是让手机自己猜）正是 §12.2 E2 要的：端点据此退避一轮就够，
+        // 不必从一个编出来的常数开始试。下限取 1ms——`retryAfterMs` 必须是正整数，
+        // 恰好卡在秒边界时 `1000 - (now % 1000)` 会是 1000，不会到 0，但这条夹取是防
+        // 将来窗口变短时静默发出 0 或负数（那会让 makeError 直接抛）。
+        const retryAfterMs = Math.max(1, 1000 - (now % 1000))
+        if (verdict.shouldReport) sendError(peer, 'rate_limited', undefined, undefined, retryAfterMs)
         if (verdict.shouldClose) {
           // 只记一次（见 Peer 上那三道闩锁的注释）：close 是优雅的，对端在这段
           // 窗口里继续灌帧，旧写法每帧一行，实测单连接 1.1s / 29.9 万行。
@@ -963,8 +1009,13 @@ export function createRelay(config: RelayConfig): RelayHandle {
       }
       // 配对码格式不对时给对端一个"用得上的"错误：客户端会把 pair-fail 的 reason
       // 翻成中文文案（F6），而 error{unknown_frame} 只会是一句看不懂的提示。
+      //
+      // **只解析一次**（2026-10-07 修）：这里与下面那条 schema 判定原来各调一次
+      // `parseEndpointFrame`，同一条坏帧要解析两遍。zod 解析是这条热路径上最贵的一步，
+      // 而"两遍"没有任何额外信息——两处读的是同一个对象、同一个 schema。
       const declaredType = (parsed as { t?: unknown } | null)?.t
-      if (typeof declaredType === 'string' && !parseEndpointFrame(parsed)) {
+      const frame = parseEndpointFrame(parsed)
+      if (!frame) {
         if (declaredType === 'pair-begin-client') {
           counters.rejectedPairs += 1
           sendToPeer(peer, pairFailFrameOf('invalid_or_expired'))
@@ -974,9 +1025,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
           sendError(peer, 'bad_pair')
           return
         }
-      }
-      const frame = parseEndpointFrame(parsed)
-      if (!frame) {
         // 区分两种"看不懂"：帧名根本不认识（unknown_frame）与
         // 名字对但形状不合法（bad_frame）。手机端会把它们当普通错误提示，
         // 但排错时这个区别很值钱——前者是对端版本不对，后者是它发了坏数据。
@@ -985,18 +1033,17 @@ export function createRelay(config: RelayConfig): RelayHandle {
         // 两条后加的）：旧实现只看 `typeof t === 'string'`，于是 `{t:'enc'}`（缺 ciphertext）
         // 这种"名字对、形状坏"的帧被报成 unknown_frame——与紧邻注释承诺的恰好相反，
         // 排障时会把"对端发了坏数据"误读成"对端版本不对"。
-        const name = (parsed as { t?: unknown } | null)?.t
-        if (typeof name !== 'string') {
+        if (typeof declaredType !== 'string') {
           sendError(peer, 'bad_json')
           return
         }
-        if (!KNOWN_FRAME_NAMES.has(name)) {
-          sendError(peer, 'unknown_frame', name, name)
+        if (!KNOWN_FRAME_NAMES.has(declaredType)) {
+          sendError(peer, 'unknown_frame', declaredType, declaredType)
           return
         }
         // 帧名同时给 host（英文细节）与用户（`userHint`）："是哪条帧坏了"两边都用得上，
         // 而英文那句只给 host（见 sendError 的注释）。
-        sendError(peer, 'bad_frame', `frame "${name}" has an invalid shape`, name)
+        sendError(peer, 'bad_frame', `frame "${declaredType}" has an invalid shape`, declaredType)
         return
       }
       if ((frame.t === 'enc' || frame.t === 'enc-batch') && !ciphertextsAreBase64(frame)) {

@@ -426,7 +426,7 @@ test('复核 R3：同一 clientId 的后来者顶掉前者，前者收到 4000 �
   }
 })
 
-test('复核 R1：主机重启后 resync 未列出的会话被回收，客户端下次发帧撞上 unknown_session', async () => {
+test('复核 R1：主机重启后 resync 未列出的会话被回收，成员当场收到 peer-left', async () => {
   const ctx = await startRelay()
   try {
     const { host, client, conversationId, hostId } = await pairUp(ctx)
@@ -438,10 +438,43 @@ test('复核 R1：主机重启后 resync 未列出的会话被回收，客户端
     reborn.send({ t: 'resync', sessionIds: [] })
     await sleep(80)
     assert.equal(ctx.relay.state.conversations.has(conversationId), false, 'resync 没列出的会话必须删掉')
-    // 关键判据：客户端不是被 peer-left 弹一句英文，而是撞 unknown_session 拿到中文提示。
+    /**
+     * **2026-10-07 改判**：这条断言原来是反过来的（`!client.has(peer-left)`），
+     * 理由是"客户端不是被 peer-left 弹一句英文，而是撞 unknown_session 拿到中文提示"。
+     * 那条理由**不成立**：mp 对 `peer-left` 的处理是 needs-pair +「主机已断开，请重新配对」，
+     * 与 `unknown_session` 那条「会话已失效，请重新配对」是同一个归宿、同样是中文。
+     *
+     * 而"只等客户端下次发帧"是**被动**的：手机停在那里不动时，界面上一切正常
+     * （在线、有会话列表），它其实连着一个已经没有钥匙的对端 —— 直到用户某一次点了发送，
+     * 才在 12 秒后知道。同一个中继在另外两条路（主机宽限期到期、主机显式 `session-leave`）
+     * 都是主动通知的，只有这一条是哑的。
+     */
+    const left = await client.until((f) => f.t === 'peer-left')
+    assert.equal(left.sessionId, conversationId, 'peer-left 必须指名是哪条会话')
+    // 主动通知**不替代**原有出口：那条会话真的没了，之后再发一帧照样是 unknown_session。
     client.send({ t: 'enc', sessionId: conversationId, ciphertext: CIPHER })
     assert.equal((await client.until((f) => f.t === 'error')).code, 'unknown_session')
-    assert.ok(!client.has((f) => f.t === 'peer-left'), 'resync 不该向客户端广播 peer-left')
+    void host
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('resync 保住会话时，成员**不许**收到 peer-left（通知不能变成乱通知）', async () => {
+  // 反向判据：上一条证明"该通知时通知了"，这一条挡住"顺手全通知"那种改法——
+  // 主机每次 hello-ok 都会发 resync（含恢复到的那几条），若那时也给成员发 peer-left，
+  // 手机每次宿主重连都会被踢回扫码页。
+  const ctx = await startRelay()
+  try {
+    const { host, client, conversationId, hostId } = await pairUp(ctx)
+    const reborn = await Peer.connect(ctx.url)
+    ctx.open.push(reborn)
+    reborn.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId })
+    await reborn.until((f) => f.t === 'hello-ok')
+    reborn.send({ t: 'resync', sessionIds: [conversationId] })
+    await sleep(80)
+    assert.equal(ctx.relay.state.conversations.has(conversationId), true, '声明过的主机会话必须留下')
+    await client.expectNone((f) => f.t === 'peer-left', 300)
     void host
   } finally {
     await ctx.close()

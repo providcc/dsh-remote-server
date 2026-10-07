@@ -171,6 +171,12 @@ test('帧洪泛：先回一次 rate_limited，持续违规则 1008 断开', asyn
     const reported = peer.frames.filter((f) => f.t === 'error' && f.code === 'rate_limited')
     assert.ok(reported.length >= 1, '必须至少告诉客户端一次为什么被限流')
     assert.ok(reported.length < 20, `限流提示不能变成错误洪水（实际 ${reported.length} 条）`)
+    // 规范 §12.2 E2：限流要带 `retryAfterMs`（端点据此退避，而不是盲退）。
+    // 帧闸是固定 1 秒窗口，所以这个数落在 (0, 1000]。
+    for (const frame of reported) {
+      assert.equal(Number.isInteger(frame.retryAfterMs), true, `retryAfterMs 必须是正整数，收到 ${frame.retryAfterMs}`)
+      assert.ok(frame.retryAfterMs > 0 && frame.retryAfterMs <= 1000, `retryAfterMs 超出 1 秒窗口：${frame.retryAfterMs}`)
+    }
   } finally {
     await server.kill()
   }
