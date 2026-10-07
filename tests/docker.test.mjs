@@ -31,6 +31,7 @@ const read = (rel) => readFileSync(join(ROOT, rel), 'utf8')
 const DOCKERFILE = read('deploy/docker/Dockerfile')
 const COMPOSE = read('deploy/docker/compose.yaml')
 const IGNORE = read('.dockerignore')
+const GUIDE = read('deploy/docker/README.md')
 
 test('Dockerfile：两条 FROM 指向同一个镜像（ARG 版本在 legacy builder 上构建失败）', () => {
   const froms = [...DOCKERFILE.matchAll(/^FROM\s+(\S+)/gm)].map((m) => m[1])
@@ -149,6 +150,36 @@ test('.dockerignore：裁掉该裁的，留住构建要用的', () => {
     IGNORE,
     /^deploy$/m,
     'deploy/ 不走 context（Dockerfile 用 -f 指定），裁掉它是可以的，但别在这里裁',
+  )
+})
+
+test('指南：镜像加速那条路必须说清"合并 daemon.json"与"核对 digest"（2026-10-07 生产实测）', () => {
+  // 这两条都不是 nice-to-have，而是踩过才知道的：
+  //
+  // ① **合并而不是覆盖**。生产那台机器的 /etc/docker/daemon.json 里已经有三条现网配置
+  //    （log-driver + log-opts、live-restore、default-address-pools）。指南原来只写
+  //    `{ "registry-mirrors": [...] }` 一行，照抄会把那三条**整个抹掉** ——
+  //    而写坏 daemon.json 会让 docker 起不来，那是那台机器上所有容器的地基。
+  // ② **核对 digest**。加速站是第三方，"拉下来了"不等于"是官方的内容"。
+  //    只有 RepoDigests 与直连 Docker Hub 一致才可信（2026-10-07 实测两者同为
+  //    sha256:0a7108bf…）。不写这一条，将来配了加速就等于无条件信任那个域名。
+  assert.match(
+    GUIDE,
+    /要合并，不能覆盖|合并而不是覆盖/,
+    '指南没写清 daemon.json 要合并 —— 照抄那一行会抹掉 log-driver / live-restore / 地址池',
+  )
+  assert.match(
+    GUIDE,
+    /RepoDigests|repoDigests/,
+    '指南没提核对 digest —— 加速站是第三方，不核对等于无条件信任它返回的字节',
+  )
+  // 反向：别把一个具体地址写成"FROM 用它"。FROM 硬写第三方域名等于把供应链
+  // 交给一个别人随时可能下线或被投毒的域名（Dockerfile 文件头已经这么判过一次）。
+  assert.doesNotMatch(
+    DOCKERFILE,
+    /1ms\.run|1ms\.cloud/,
+    'Dockerfile 的 FROM 里出现了具体镜像站域名：可达性该由环境（daemon.json）解决，' +
+      '而不是把供应链交给那个域名',
   )
 })
 
