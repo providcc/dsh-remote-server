@@ -50,6 +50,34 @@ import { RelayState, WS_OPEN, type Sock } from './state.js'
 const CLOSE_REPLACED = 4000
 
 /**
+ * 停机时等对端走完关闭握手的时长（ms），过了就 `terminate()`。
+ *
+ * 取 1.5 s 的理由：`<main.ts>` 的兜底 guard 是 5 s（`.close()` 返回后主进程才 exit），
+ * 排空必须留出余量；而 1.5 s 已经足够一次正常的 TCP 往返 + 小程序的 close 帧应答
+ * （实测正常断开在毫秒级）。它远小于 `TimeoutStopSec=15`（systemd 单元）与
+ * `stop_grace_period: 15s`（compose），所以容器与 systemd 都不会先动粗。
+ */
+
+const DRAIN_MS = 1_500
+
+/**
+ * resync 触发的落盘的最小间隔（ms）。
+ *
+ * resync 是**逐帧**可发的（帧闸 500/s 全放行），而落盘是同步写整张表 —— 实测 5000 条
+ * 会话时 2.22 ms/次，一台已认证主机连发就能占满整个事件循环，于是 ping 判定跟着停、
+ * 所有对端被 heartbeat timeout terminate。
+ *
+ * 而**不能**简单地「只在删了会话时才写」：HANDOFF 0.10.5 第 4 条修过的那条是
+ * 「resync 给一条空会话打上 emptySince 却不落盘」——重启后 restoreState 按「此刻起算」
+ * 补上计时，空会话回收被推迟整整一个 TTL。
+ *
+ * 于是两者之间取这个间隔：空会话计时的落盘**至多晚 2 秒**，而洪泛下的写盘次数从
+ * 「每帧一次」变成「每 2 秒一次」。删会话那条路不受限流——每个会话只会被删一次，
+ * 天然有界。
+ */
+const RESYNC_PERSIST_MIN_GAP_MS = 2_000
+
+/**
  * 协议里"存在"的全部帧名（wire 的 F1 冻结表 + `resync`/`session-leave` 两条后加的）。
  *
  * 只用于一处：把"帧名根本不认识"（对端版本不对 → unknown_frame）与"名字认识但形状
@@ -86,6 +114,25 @@ interface Peer {
   pairAttempts: number
   /** 对端 socket 缓冲区持续超限的计时（慢消费者处置）；窗口按角色给，见 noteBackpressure。 */
   backpressure: BackpressureGate
+  /**
+   * "这条连接上某类逐帧事件**已经记过一次**"的三道闩锁。
+   *
+   * 为什么需要：限流与限配的判定是**每帧**求值的，而 `ws.close()` 是优雅关闭——
+   * 对端还在灌帧的那段窗口里，判定照样每帧成立。旧写法于是让
+   * `frame flood disconnected` 变成逐帧日志：实测**单条未认证连接 1.1 秒写
+   * 299,498 行**（约 33 MB）。journald 按**条数**限流不按字节，于是中继自己的正常
+   * 诊断（`uncaught exception`、`counters`、`slow consumer`）被一起抑制——排障
+   * 现场变成空白，而这正是 log.ts 文件头记录的那起事故（8.19 MB / 1.2 s）的同一条
+   * 通路，只是从"被认证前"变成"可无限持续"。nginx 挡不住：`limit_req` 计的是
+   * HTTP 请求数，升级之后不再计帧。
+   *
+   * 所以这条纪律是：**判定逐帧，记账只记一次**。
+   */
+  notedFrameFlood: boolean
+  /** 同上：`enc from non-member` 一条连接只记一次。 */
+  notedNonMember: boolean
+  /** 同上：全局配对配额用尽那条 warn，每秒最多一行（0 = 还没记过）。 */
+  pairBudgetWarnedAt: number
   alive: boolean
   /**
    * 这条连接属于哪个 ping 桶（见 sweepPingBucket）。建连时按轮转序号取模分配，
@@ -144,7 +191,29 @@ export function createRelay(config: RelayConfig): RelayHandle {
    * 读坏了/没有文件都按空启动，绝不拒绝启动（`persist.ts` 的纪律第 2 条）。
    */
   const persistence = { enabled: config.stateFile !== '', restored: 0, savedAt: 0, writes: 0, failures: 0 }
-  if (persistence.enabled) persistence.restored = restoreState(config.stateFile, state, log, startedAt)
+  if (persistence.enabled) {
+    persistence.restored = restoreState(config.stateFile, state, log, startedAt)
+    /**
+     * **启动时立刻写一次**（2026-10-07 补）。
+     *
+     * 为什么不能只靠周期补写：落盘失效时中继的外部表现是"配对完全正常，只是重启就没"，
+     * 而周期补写最早也要等 `DRC_STATE_SAVE_MS`（默认 60 s）才留下第一条痕迹。
+     * 这正是 HANDOFF §0.1 那次 EROFS 的形状——`systemctl status` 看不出来、
+     * `/healthz` 的 `conversations` 是对的，只有 `stateWriteFailures` 这个字段能指出来，
+     * 而它要等一分钟才有第一个非零值。
+     *
+     * 所以启动就试一次：容器里忘了挂卷/属主不对、systemd 里 StateDirectory 没配，
+     * 这两类**部署形态**的失误会在进程起来的那一秒变成一条 **error** 日志，
+     * 而不是一分钟里 60 条 warn 里的一条。失败**不**拒绝启动（落盘是增强，中继本身
+     * 仍然可用），但它必须是全场最响的一行。
+     */
+    if (!persistNow()) {
+      log.error('state file is not writable — pairing will NOT survive a restart', {
+        path: config.stateFile,
+        hint: 'check the directory exists and is writable by this process (systemd: StateDirectory=; docker: the /data volume owner)',
+      })
+    }
+  }
 
   /** 真正写一次盘。返回是否成功——失败只计数，不抛（见 writeStateFile 的注释）。 */
   function persistNow(): boolean {
@@ -158,6 +227,36 @@ export function createRelay(config: RelayConfig): RelayHandle {
     }
     return ok
   }
+
+  /**
+   * 结构性变更后的落盘**请求**，而不是立刻落盘（2026-10-07 审计修，F6）。
+   *
+   * 为什么要合并：`markStateChanged()` 原来每次都同步写整个会话表，而它的一个调用点
+   * 是 `resync` —— 而 `resync` 是**逐帧**可发的（主机只要连发，帧闸默认 500/s 全放行）。
+   * 实测单次写的同步阻塞：10 / 100 / 1000 / 5000 条会话 = 0.20 / 0.27 / 0.59 / 2.22 ms，
+   * 乘以 500 帧/秒就是 **10% / 13% / 29% / 111% 的整个事件循环**。事件循环被吃光之后，
+   * 所有对端一起遭殃：ping 判定跟着停 → 被 `heartbeat timeout` terminate → 手机
+   * 全体看到"连接已断开，正在重连"。一台**已认证**主机就能做到这件事。
+   *
+   * 合并窗口取 200 ms：结构性变更（建会话/删会话）仍然在"下一次事件循环的空隙"里落盘，
+   * 崩溃最多丢 200 ms 的变更；而高频路径上它把写盘次数从"每帧一次"压到"每秒 5 次"。
+   * 停机路径（`close()` / `forceShutdown()`）**不等**这个窗口，直接强制写。
+   */
+  /**
+   * 立刻落盘。
+   *
+   * 这里**刻意不做合并/防抖**（2026-10-07 评估过一轮后否决）：配对那条路的注释写着
+   * 「一次落盘换一次扫码，这个代价比什么都划算」，而配对表的规模有界（拓扑恒 1:1，
+   * 会话数 ≈ 配对过的客户端数）。实测 5000 条会话时一次同步写 2.22 ms，而配对本身被
+   * 全局配额 20/s 限着 → 最坏 4% 的事件循环，可以接受。
+   *
+   * 真正会被**逐帧**打爆的只有 @@resync@@（帧闸 500/s 全放行，主机连发即可）。
+   * 实测 5000 条会话时每帧一次 resync 会让一次写占 **2.22 ms × 500 帧/秒 = 111% 的
+   * 整个事件循环**，于是 ping 判定跟着停 → 所有对端被 heartbeat timeout terminate →
+   * 手机全体「连接已断开，正在重连」。修法不是给所有写盘加延迟（那会把上面那条
+   * 「配对立刻落盘」的保证一起削掉），而是按**语义**分：resync 删了会话、或者给某条
+   * 会话打上了空会话回收计时，这两件事才立刻写；只刷新 lastActivityAt 的交给周期补写。
+   */
 
   /**
    * 会话表发生**结构性**变化后立刻落盘（建/删会话、成员表变动）。
@@ -377,9 +476,21 @@ export function createRelay(config: RelayConfig): RelayHandle {
       return
     }
     const issued = state.issuePair(peer.hostId, frame.pairingToken, config.pairTtlMs)
-    if (!issued.ok) {
-      sendError(peer, 'pair_table_full')
-      log.warn('pair table full', { hostId: peer.hostId })
+    if (!issued.conflict) {
+      if (!issued.ok) {
+        sendError(peer, 'pair_table_full')
+        log.warn('pair table full', { hostId: peer.hostId })
+        return
+      }
+    } else {
+      // 这个 token 是**另一台主机**发出来的（共享同一个 DRC_HOST_TOKEN 时可能发生）。
+      // 旧写法会静默把条目改写成调用方，于是"扫 A 屏幕上的码、配到 B"，
+      // 而且用户与两边的主机都不会看到任何异常。现在明确拒绝并留痕。
+      log.warn('pair token belongs to another host, refused', {
+        hostId: peer.hostId,
+        token: REDACTED,
+      })
+      sendError(peer, 'bad_pair', 'this pairing token was issued by another host')
       return
     }
     // **服务端权威 TTL**：主机必须据此改写本地过期时间（旧实现的第一起事故）。
@@ -400,7 +511,18 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // 对用户有意义且成立的只有"这张码现在配不上"，真正的限速原因进日志给运维。
       counters.rejectedPairs += 1
       sendToPeer(peer, pairFailFrameOf('invalid_or_expired'))
-      log.warn('pair budget exhausted (global)', { clientId: peer.clientId, reason: 'rate_limited' })
+      // **每秒最多一行**（见 Peer 上那三道闩锁）。旧写法逐帧记：配额用尽的那一秒里
+      // 单条连接能写 ~480 行，200 条连接就是 ~10 万行/秒 —— journald 按条数额度
+      // （RateLimitBurst=10000）打满之后，**中继自己的正常诊断日志被一起丢掉**，
+      // 而"限配了"这件事恰好是最需要留痕的那一类。
+      //
+      // 出站那条 pair-fail 仍然是逐帧的：它是给对端的**功能性**答复（对端要靠它
+      // 停止重试），不是日志。
+      const now = Date.now()
+      if (now - peer.pairBudgetWarnedAt >= 1000) {
+        peer.pairBudgetWarnedAt = now
+        log.warn('pair budget exhausted (global)', { clientId: peer.clientId, reason: 'rate_limited' })
+      }
       return
     }
     const claimed = state.claim(frame.pairingToken, peer.clientId)
@@ -453,7 +575,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
     const rejected = state.routeFrom(frame.sessionId, peer.ws, peer.role)
     if (rejected) {
       sendError(peer, rejected)
-      if (rejected === 'not_member') log.warn('enc from non-member', { sessionId: frame.sessionId })
+      // 同样只记一次：这条判定是逐帧的，而一个持有（或曾经持有）某个 convId 的
+      // 对端可以拿它当探针连打几百帧。
+      if (rejected === 'not_member' && !peer.notedNonMember) {
+        peer.notedNonMember = true
+        log.warn('enc from non-member', { sessionId: frame.sessionId, clientId: peer.clientId, role: peer.role })
+      }
       return
     }
     if (peer.role === 'client') {
@@ -522,6 +649,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
     for (const sock of clients) sendTo(sock, encBatchToClient(frame.sessionId, items))
   }
 
+  let lastResyncPersistAt = 0
+
   function handleFrame(peer: Peer, frame: EndpointFrame): void {
     switch (frame.t) {
       case 'hello':
@@ -538,13 +667,26 @@ export function createRelay(config: RelayConfig): RelayHandle {
           sendError(peer, 'need_host')
           return
         }
-        const { kept, dropped } = state.resync(peer.hostId, frame.sessionIds)
-        // resync 的两种后果**都**要进盘，所以这里无条件落盘（而不是只在 dropped 时写）：
-        // ① 删会话；② 留下的会话被打上 `lastActivityAt` 与空会话回收计时 `emptySince`。
-        // 只在 ① 时写的话，盘上会留着一个"还空着、却没开始计时"的会话——重启后
-        // `restoreState` 按"此刻起算"补上计时，于是回收被推迟整整一个空会话 TTL。
-        // 主机每次(重)启动只发一条 resync，一次写盘的量可以忽略。
-        markStateChanged()
+        const { kept, dropped, emptyAtRisk } = state.resync(peer.hostId, frame.sessionIds)
+        // resync 有三种后果，两种要进盘：
+        // ① 删会话（dropped）—— 永久删除，不写就会在重启后被复活；
+        // ② 给空会话保证回收计时（emptyAtRisk）—— HANDOFF 0.10.5 第 4 条修过的那条：
+        //    不写的话盘上会留着一个「还空着、却没开始计时」的会话，重启后 restoreState
+        //    按「此刻起算」补上计时，空会话回收被推迟整整一个 TTL；
+        // ③ 只刷新 lastActivityAt —— 不写，交给周期性补写（DRC_STATE_SAVE_MS，
+        //    它存在的理由就是刷新这一个字段）。
+        //
+        // ② 要限流而 ① 不要（见 RESYNC_PERSIST_MIN_GAP_MS 的注释）：resync 是**逐帧**
+        // 可发的，落盘是同步写整张表，实测 5000 条会话时 2.22 ms/次；主机以帧闸允许的
+        // 500 帧/秒连发，删会话那条路天然有界（每个会话只会被删一次），而②没有。
+        const now = Date.now()
+        if (dropped.length > 0) {
+          lastResyncPersistAt = now
+          markStateChanged()
+        } else if (emptyAtRisk > 0 && now - lastResyncPersistAt >= RESYNC_PERSIST_MIN_GAP_MS) {
+          lastResyncPersistAt = now
+          markStateChanged()
+        }
         if (dropped.length > 0) {
           log.info('conversations dropped at host resync', { hostId: peer.hostId, kept, dropped: dropped.length })
         }
@@ -604,16 +746,35 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   // ── 连接生命周期 ────────────────────────────────────────────────────
 
+  /**
+   * 拒掉一条连接的统一出口（2026-10-07 审计修，**未认证可达**）。
+   *
+   * `ws.on('error')` 必须在 close **之前**挂上。早期两条早退分支（停机中 / 超连接数）
+   * 直接 `ws.close()` 就 return，从未挂过监听器——而 EventEmitter 没有 `error` 监听器
+   * 时，`emit('error')` 本身**同步抛**。于是这样一条连接只要在握手后再发一帧
+   * 畸形帧（超 `maxPayload`、RSV 位非零、非法 UTF-8……），ws 内部的
+   * `emitErrorAndClose` 就会把整个中继带崩：`uncaughtException` → exit 1 →
+   * `Restart=always` 拉起 → **内存里的配对表清零**，所有手机回到电脑前重扫，
+   * 而且可以无限重复（它不需要任何凭据，只要先把连接数顶满）。
+   *
+   * 复现方式与对照组见 `tests/hardening.test.mjs`：同一条畸形帧在正常连接上
+   * 只被捕获（已有监听器），在被拒连接上会让进程带着 exit 42 消失。
+   */
+  function rejectConnection(ws: WebSocket, code: number, reason: string): void {
+    ws.on('error', (e: Error) => log.warn('socket error', { message: String(e?.message ?? e) }))
+    ws.close(code, reason)
+  }
+
   function onConnection(ws: WebSocket): void {
     if (shuttingDown) {
-      ws.close(1013, 'server_shutdown')
+      rejectConnection(ws, 1013, 'server_shutdown')
       return
     }
     // 计数**必须**是 `wss.clients.size` 本身：这条回调跑的时候 `ws` 已经被
     // `WebSocketServer` 加进 `clients`（ws 在 `completeUpgrade` 里先 `clients.add(ws)`
     // 再回调），旧写法 `+ 1` 把新连接算了两次 → `DRC_MAX_CONNS=3` 实际只收 2 条。
     if (wss.clients.size > config.maxConnections) {
-      ws.close(1013, 'server_busy')
+      rejectConnection(ws, 1013, 'server_busy')
       return
     }
     const peer: Peer = {
@@ -622,6 +783,11 @@ export function createRelay(config: RelayConfig): RelayHandle {
       rate: new FrameRateGate(config.maxFramesPerSec),
       authAttempts: 0,
       pairAttempts: 0,
+      // 下面三条"只记一次"闩锁：限流与限配是**逐帧**触发的，日志与出站帧若也逐帧，
+      // 一条未认证连接就能把 journald 的条数额度吃干净（见各自注释）。
+      notedFrameFlood: false,
+      notedNonMember: false,
+      pairBudgetWarnedAt: 0,
       backpressure: new BackpressureGate(),
       alive: true,
       // 轮转序号取模分配：**均匀是刻意的**。哪怕重启风暴里 10k 条连接在几十秒内
@@ -636,7 +802,17 @@ export function createRelay(config: RelayConfig): RelayHandle {
       if (!verdict.allowed) {
         if (verdict.shouldReport) sendError(peer, 'rate_limited')
         if (verdict.shouldClose) {
-          log.warn('frame flood disconnected', { clientId: peer.clientId, hostId: peer.hostId })
+          // 只记一次（见 Peer 上那三道闩锁的注释）：close 是优雅的，对端在这段
+          // 窗口里继续灌帧，旧写法每帧一行，实测单连接 1.1s / 29.9 万行。
+          if (!peer.notedFrameFlood) {
+            peer.notedFrameFlood = true
+            log.warn('frame flood disconnected', {
+              clientId: peer.clientId,
+              hostId: peer.hostId,
+              role: peer.role,
+              violations: peer.rate.violationCount,
+            })
+          }
           ws.close(1008, 'rate_limited')
         }
         return
@@ -918,6 +1094,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
       const url = new URL(req.url ?? '/', 'http://relay.invalid')
       res.setHeader('content-type', 'application/json; charset=utf-8')
       if (url.pathname === '/healthz') {
+        // 停机中回 **503**（2026-10-07 改）。理由：`ok:false` 这个字段在改造前是
+        // `/healthz` 唯一的停机信号，于是任何只看状态码的观测面（Docker HEALTHCHECK、
+        // 负载均衡器、k8s probe、`curl --fail`）都会在**正在关闭**的进程上读到 200，
+        // 继续往一个不再接受 upgrade 的实例上送流量。状态码本来就是这件事的表达方式，
+        // 字段留给人去读。
+        if (shuttingDown) res.statusCode = 503
         res.end(JSON.stringify(health()))
         return
       }
@@ -963,6 +1145,24 @@ export function createRelay(config: RelayConfig): RelayHandle {
   }
 
   const http = createServer(httpHandler)
+  /**
+   * **常驻**的 'error' 监听器（2026-10-07 审计修）。
+   *
+   * `startListening` 里那一句 `http.once('error', reject)` 在 listen 成功后就 `off` 了，
+   * 于是此后 **http server 上再没有任何 'error' 监听器**——而 EventEmitter 没有
+   * 'error' 监听器时 `emit('error')` 会同步抛。Node 的 net 层对**每一次 accept 失败**
+   * （EMFILE / ENFILE / ENOBUFS / ENOMEM，并发连接把 fd 打满时就会发生）执行
+   * `server.emit('error', err)`，于是：一条 fd 打满的连接洪峰 → 异常冒出 →
+   * `main.ts` 的 uncaughtException → exit 1 → `Restart=always` → **内存会话表清零**。
+   * 这与本文件头 P0-1 那条纪律（"HTTP 侧的任何异常都不许冒到进程"）是同一条，
+   * 旧实现只是漏了 listen 之后的那一半。
+   *
+   * 为什么记 warn 之后**不**退出：accept 失败是瞬时的（文件描述符会随对端断开释放），
+   * 此时退出等于"活着但坏了"的反面 —— 活着且降级，比死了被拉起来好。
+   */
+  http.on('error', (error) => {
+    log.warn('http server error', { message: String((error as Error)?.message ?? error) })
+  })
   http.headersTimeout = 30_000
   http.requestTimeout = 30_000
   http.keepAliveTimeout = 15_000
@@ -1014,6 +1214,34 @@ export function createRelay(config: RelayConfig): RelayHandle {
   })
   wss.on('connection', (ws) => onConnection(ws))
 
+  /**
+   * 排空：等所有对端真的走完关闭握手，最多等 `DRAIN_MS`。
+   *
+   * 为什么必须显式等，而不是直接 `await http.close()`（2026-10-07 审计）：
+   * 升级过的 WebSocket socket 是**由对端决定何时消失**的——手机进电梯、切 4G、
+   * 主机休眠时它既不发 FIN 也不回关闭帧。这种 socket 会让 `http.close()` 的回调
+   * **永不触发**，于是每一次这样的停机都走满 5 秒兜底（`main.ts` 的 guard），
+   * 并留下一条 `shutdown forced`。反过来，空闲的 keep-alive HTTP 连接**不阻塞**
+   * `close()`（Node ≥19 自己关），所以"被拖住"的只有 WS 侧——这也解释了为什么
+   * 改造前它只在有手机连着的时候出现。
+   *
+   * 兜底是 `terminate()`：对端不接关闭帧时，TCP 层直接断，状态随之收敛。
+   */
+  async function drain(): Promise<void> {
+    if (wss.clients.size === 0) return
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + DRAIN_MS
+      const tick = (): void => {
+        if (wss.clients.size === 0 || Date.now() >= deadline) {
+          resolve()
+          return
+        }
+        setTimeout(tick, 20).unref?.()
+      }
+      tick()
+    })
+  }
+
   async function close(): Promise<void> {
     if (sweepTimer) clearInterval(sweepTimer)
     if (pingTimer) clearInterval(pingTimer)
@@ -1022,11 +1250,20 @@ export function createRelay(config: RelayConfig): RelayHandle {
     // 这一写也让"关机前最后状态"与"重启后读到的状态"一致，排障时不必去猜中间发生了什么。
     if (persistence.enabled) persistNow()
     wss.clients.forEach((ws) => ws.close(1001, 'server_shutdown'))
+    await drain()
+    for (const ws of wss.clients) {
+      try {
+        ws.terminate()
+      } catch {
+        /* 已经没了 */
+      }
+    }
     await new Promise<void>((resolve) => http.close(() => resolve()))
     // **排空之后再写一次**（P2）：第一次写发生在 `ws.close()` 之前，而这之后
     // socket 的 `close` 回调还会改状态（`clientGone` 更新 lastActivityAt、
-    // 主机掉线打宽限期计时……）——只写一次的话，盘上永远是"开始停机那一刻"的版本，
-    // 那段窗口里的变更随进程一起消失。第二次写补齐它。
+    // 主机掉线打宽限期计时……）——只写一次的话，盘上永远是"开始停机那一刻"的版本。
+    // `drain()` 保证这一次写发生在所有 close 回调之后：旧写法只是"多数时候"成立
+    // （http.close 的回调与 ws 的 close 回调谁先跑，取决于 Node 内部的监听器注册序）。
     if (persistence.enabled) persistNow()
   }
 

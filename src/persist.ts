@@ -38,7 +38,7 @@
  *
  * 本文件不 import `ws`、不 import `server.ts`，可以纯内存单测。
  */
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { CONVERSATION_ID_PREFIX } from 'dsh-remote-wire/ids'
 import type { Log } from './log.js'
@@ -87,6 +87,12 @@ function sanitize(raw: unknown): { conversations: PersistedConversation[]; dropp
   if (!Array.isArray(raw)) return { conversations: [], dropped: 0 }
   const conversations: PersistedConversation[] = []
   let dropped = 0
+  // 同一个 conversationId 出现两次时，保留**第一条**并把后面的计入 dropped
+  // （2026-10-07 审计）。旧实现两条都收进数组、restoreState 用 Map.set 覆盖，于是读盘
+  // 日志说「恢复 N 条」、紧接着恢复日志说「N-1 条」，中间那条用户的会话静默消失
+  //（手机下次发帧拿到 unknown_session），而**没有任何 dropped 计数**指出这件事。
+  // 重复的来源：手改文件，或两个中继实例指向同一个状态文件。
+  const seen = new Set<string>()
   for (const item of raw) {
     if (typeof item !== 'object' || item === null) {
       dropped += 1
@@ -96,6 +102,7 @@ function sanitize(raw: unknown): { conversations: PersistedConversation[]; dropp
     if (
       !isNonEmptyString(entry.conversationId) ||
       !CONVERSATION_ID_RE.test(entry.conversationId) ||
+      seen.has(entry.conversationId) ||
       !isNonEmptyString(entry.hostId) ||
       !Array.isArray(entry.clients) ||
       !entry.clients.every(isNonEmptyString) ||
@@ -107,6 +114,7 @@ function sanitize(raw: unknown): { conversations: PersistedConversation[]; dropp
       dropped += 1
       continue
     }
+    seen.add(entry.conversationId)
     const conversation: PersistedConversation = {
       conversationId: entry.conversationId,
       hostId: entry.hostId,
@@ -212,18 +220,58 @@ export function snapshotState(state: RelayState, now: number): PersistedState {
 export function restoreState(path: string, state: RelayState, log: Log, now: number): number {
   const file = readStateFile(path, log)
   if (!file) return 0
+  let clamped = 0
   for (const entry of file.conversations) {
+    // **未来时间戳一律夹到此刻**（2026-10-07 审计）。两个消费端都是单边比较：`sweepIdle`
+    // 判 `now - lastActivityAt >= ttlMs`、`sweepEmpty` 判 `now - emptySince >= emptyTtlMs`。
+    // 于是盘上一个偏快的时钟（RTC 复位、NTP 回调、VM 快照恢复、跨机拷回）写下的时间戳，
+    // 在偏斜量 ≥ TTL 时会让那条会话**永久不可回收**：/healthz 的 conversations 只增不减、
+    // 空会话回收形同虚设，而更糟的是它每 60 s 又被周期补写**原样写回盘上**——错误自我
+    // 固化、永不自愈。空会话 TTL 默认只有 30 分钟，几小时的时钟偏斜就足够触发。
+    const lastActivityAt = entry.lastActivityAt > now ? now : entry.lastActivityAt
+    const rawEmptySince = entry.emptySince !== undefined && entry.emptySince > now ? now : entry.emptySince
+    if (lastActivityAt !== entry.lastActivityAt || rawEmptySince !== entry.emptySince) clamped += 1
+
     const conv: Conversation = {
       hostId: entry.hostId,
       clients: new Set(entry.clients),
       seqHost: entry.seqHost,
-      lastActivityAt: entry.lastActivityAt,
+      lastActivityAt,
     }
-    conv.emptySince = conv.clients.size === 0 ? (entry.emptySince ?? now) : undefined
+    conv.emptySince = conv.clients.size === 0 ? (rawEmptySince ?? now) : undefined
     state.conversations.set(entry.conversationId, conv)
+  }
+  if (clamped > 0) {
+    // 留痕而不是静默修正：出现这个数说明**这台机器的时钟与写盘那台不一致**，那是要去查的
+    // （一次 NTP 步进、一次 VM 快照恢复），不是中继能自己决定的事。
+    log.warn('state file timestamps in the future, clamped to now', { path, clamped })
   }
   log.info('state restored', { path, conversations: state.conversations.size })
   return state.conversations.size
+}
+
+/**
+ * 把一个路径 fsync 到盘上。
+ *
+ * `strict=false`（目录）时不抛：见调用点的说明，目录 fsync 在个别平台/文件系统上不被
+ * 支持，而「没成功」与「没试」在排障时是两回事，所以留一行 debug 痕迹。
+ */
+function syncPath(target: string, log: Log, strict = true): void {
+  let fd: number | undefined
+  try {
+    fd = openSync(target, 'r')
+    fsyncSync(fd)
+  } catch (e) {
+    // strict（文件本身）时抛出 → 外层 catch 记 warn 并计一次 stateWriteFailures，
+    // 那才是「这次落盘没成功」；目录那一次 best-effort，只留 debug 痕迹。
+    if (strict) throw e
+    log.debug('directory fsync unsupported, continuing', {
+      path: target,
+      message: String((e as Error)?.message ?? e),
+    })
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
 }
 
 /**
@@ -252,7 +300,16 @@ export function writeStateFile(path: string, snapshot: PersistedState, log: Log)
     }
     writeFileSync(tmp, `${JSON.stringify(snapshot)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     chmodSync(tmp, 0o600)
+    // **fsync 之后再 rename**（2026-10-07 审计补，纪律第 1 条的后半段）。
+    // 文件头那条「原子写」只对两种读者成立：并发的另一个进程（rename 不会让它看到半截）
+    // 与**进程**崩溃。它管不到**掉电**：没有 fsync，rename 可能已落进目录，而 tmp 的内容
+    // 还在 page cache 里，回电后得到一个**长度正确、内容全零或半截**的 state.json →
+    // 读它走 JSON 解析失败那条路 → 所有配对作废、所有手机回电脑前重扫。而「落盘」这个
+    // 特性存在的唯一理由（文件头那 07:09 的日志）恰恰就是消灭这个症状。
+    syncPath(tmp, log)
     renameSync(tmp, path)
+    // 目录项本身也要落盘：rename 的持久性由**父目录**的 fsync 保证，不是文件的。
+    syncPath(dirname(path), log, false)
     return true
   } catch (e) {
     log.warn('state file write failed', { path, message: String((e as Error)?.message ?? e) })

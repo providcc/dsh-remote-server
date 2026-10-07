@@ -138,16 +138,47 @@ export class RelayState implements Clock {
   // ── 配对 ────────────────────────────────────────────────────────────
 
   /**
-   * 主机发布配对码。已存在的 token 允许覆盖（同码重发是正常操作），
-   * 新 token 在表满时被拒。
+   * 主机发布配对码。三条语义，每条都对应一个「看起来正常、其实出事」的旧形状
+   * （2026-10-07 审计）：
+   *
+   * 1. **同码重发是正常操作**：主机刷新一张还没被用的码，只延长它的 TTL。
+   * 2. **但绝不复活一张已被认领的码**。旧写法无条件 `used: false`，于是主机在码被认领
+   *    之后再发一次同一个 token，那张码就能被**第二台**手机认领、开出第二条会话——
+   *    而两条会话在主机那边按 pairingToken 取到的是**同一把 PSK**（`peer-joined` 帧带着它），
+   *    于是同一密钥下挂两条通道、密文流互串。旧注释说「同码重发是正常操作」，
+   *    它没说「同码重发能让一张用过的码再用一次」。
+   * 3. **不静默改写在途码的归属**：共享同一个 `DRC_HOST_TOKEN` 的另一台主机可以发一个
+   *    与 hostA 此刻在途相同的 token 把条目改写成自己的——手机扫的是 **hostA 屏幕上的码**，
+   *    配到的却是 hostB，而用户与两边主机都不会看到任何异常。冲突时返回 `conflict`。
+   *
+   * 容量判定数的是**还能被认领的码**，不含墓碑：`used` 条目现在活到 TTL 才清（见
+   * `expirePairs`），若把它们也算进表容量，一次高频重配（全局配额 20/s）会在两分钟内
+   * 把默认 1000 的表塞满，于是正常配对开始回 `pair_table_full`。
    */
-  issuePair(hostId: string, token: string, ttlMs: number): { ok: boolean; replaced: boolean; full: boolean } {
-    const existed = this.pendingPairs.has(token)
-    if (!existed && this.pendingPairs.size >= this.maxPendingPairsValue) {
+  issuePair(
+    hostId: string,
+    token: string,
+    ttlMs: number,
+  ): { ok: boolean; replaced: boolean; full: boolean; conflict?: boolean } {
+    const existing = this.pendingPairs.get(token)
+    if (existing && existing.hostId !== hostId) return { ok: false, replaced: false, full: false, conflict: true }
+    if (!existing && this.countClaimablePairs() >= this.maxPendingPairsValue) {
       return { ok: false, replaced: false, full: true }
     }
-    this.pendingPairs.set(token, { hostId, expiresAt: this.now() + ttlMs, used: false })
-    return { ok: true, replaced: existed, full: false }
+    // 同码重发只延长 TTL；`used` 一旦为真就**保持**为真（见上面第 2 条）。
+    this.pendingPairs.set(token, {
+      hostId,
+      expiresAt: this.now() + ttlMs,
+      used: existing?.used === true,
+    })
+    return { ok: true, replaced: existing !== undefined, full: false }
+  }
+
+  /** 还能被认领的码数（`/api/pair-status` 与主机侧「还有没有码可发」问的都是它）。 */
+  countClaimablePairs(): number {
+    let n = 0
+    for (const entry of this.pendingPairs.values()) if (!entry.used) n += 1
+    return n
   }
 
   /** 客户端认领配对码：一次性、TTL 内、主机在挂。成功即创建会话。 */
@@ -173,12 +204,25 @@ export class RelayState implements Clock {
     return { ok: true, conversationId, hostId: pending.hostId, detached }
   }
 
-  /** 主机侧的过期表：返回被清掉的 token（调用方不需要再通知任何人）。 */
+  /**
+   * 主机侧的过期表：返回被清掉的 token（调用方不需要再通知任何人）。
+   *
+   * `used` 的条目**同样活到 TTL 才清**（2026-10-07 审计修）。旧写法是
+   * `entry.used || entry.expiresAt < now`：一旦用过，下一轮清扫（默认 5 s）就被删掉，
+   * 于是同一张码在 **5 秒前后给出两句互斥的话**——5 s 内重输拿到 `already_used`
+   *（「该配对码已被使用」），5 s 后再输变成 `invalid_or_expired`（「配对码无效或已过期」）。
+   * 配对那一瞬间手机崩溃/断网、用户重新输码的场景正好落在这个窗口里，而「码写错了」
+   * 这个结论会把人送回电脑前。
+   *
+   * 这也让本文件头那条不变量（第 3 条）与 SELF-HOSTING.md §4 的运维契约**真的成立**：
+   * 「已用标记在 TTL 窗口内保留」——旧实现只保留了 5 秒。墓碑占用的表容量由
+   * `countClaimablePairs` 排除（见 `issuePair`）。
+   */
   expirePairs(): string[] {
     const now = this.now()
     const dropped: string[] = []
     for (const [token, entry] of this.pendingPairs) {
-      if (entry.used || entry.expiresAt < now) {
+      if (entry.expiresAt < now) {
         this.pendingPairs.delete(token)
         dropped.push(token)
       }
@@ -222,10 +266,14 @@ export class RelayState implements Clock {
    * `unknown_session`，从而拿到中文的"请重新配对"提示。
    * 不这么做的后果是永久静默：中继表命中、主机解不开、手机没有任何反馈。
    */
-  resync(hostId: string, sessionIds: readonly string[]): { kept: number; dropped: string[] } {
+  resync(
+    hostId: string,
+    sessionIds: readonly string[],
+  ): { kept: number; dropped: string[]; emptyAtRisk: number } {
     const claimed = new Set(sessionIds)
     const dropped: string[] = []
     let kept = 0
+    let emptyAtRisk = 0
     for (const [conversationId, conv] of [...this.conversations]) {
       if (conv.hostId !== hostId) continue
       if (claimed.has(conversationId)) {
@@ -233,7 +281,15 @@ export class RelayState implements Clock {
         conv.lastActivityAt = this.now()
         // 主机重启后重新声明的会话：成员表它自己的重连会补上，此刻仍是空的就**从这一刻**
         // 起算空会话回收——否则一条重启前就被掏空的会话会因为没人打点而挂到 7 天。
+        const wasEmpty = conv.clients.size === 0
         this.markEmpty(conv, this.now())
+        // 此刻**处于空会话状态**的条数（2026-10-07 补）。调用方用它决定要不要立刻落盘：
+        // resync 是逐帧可发的，而落盘是同步写整张表（5000 条会话实测 2.22 ms/次），主机
+        // 以帧闸允许的 500/s 连发就能占满整个事件循环、把所有对端一起拖垮。
+        // 注意它数的是「此刻是空的」而不是「这一帧新打上的」——后者会漏掉真正要紧的那种：
+        // restoreState 从盘上读回一个空的、盘上却没有 emptySince 的会话时只在内存里补了
+        // 计时，盘上仍然空着，而那正是 HANDOFF 0.10.5 第 4 条要求立刻写盘的情形。
+        if (wasEmpty && conv.emptySince !== undefined) emptyAtRisk += 1
         kept += 1
         continue
       }
@@ -244,7 +300,7 @@ export class RelayState implements Clock {
     // 属于别的主机（或早已不存在）的 convId，旧写法 `claimed.size - dropped.length`
     // 会把它们一起算进去，日志里的 kept 于是比实际大——而这条日志正是运维判断
     // "主机还记得几条会话"的唯一出口。
-    return { kept, dropped }
+    return { kept, dropped, emptyAtRisk }
   }
 
   /** host→client 方向由中继编号；客户端从不读它（F13）。 */

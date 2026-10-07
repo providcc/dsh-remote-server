@@ -27,7 +27,12 @@ export class Budget {
 
   /** 取一个配额；成功 true，用尽 false。 */
   take(now: number): boolean {
-    if (now - this.windowAt >= this.windowMs) {
+    // 那条 `now < this.windowAt` 是**时钟回拨**兜底（2026-10-07 审计）：`date -s` 回拨、
+    // VM 快照恢复、ntpd 从 slew 退化成 step 之后，`windowAt` 仍停在未来的那个值，
+    // 于是 `now - windowAt` 在接下来整整 T 秒里都是负数、永远达不到 windowMs，而 left
+    // 又已归零 —— 全局限流**冻死**：配对一路失败（手机上翻成「配对码无效或已过期」，
+    // 真实原因只在日志里），每条连接的帧闸同样冻死。一台机器 NTP 抖一下就够。
+    if (now - this.windowAt >= this.windowMs || now < this.windowAt) {
       this.windowAt = now
       this.left = this.perWindow
     }
@@ -77,6 +82,14 @@ export class FrameRateGate {
     const shouldReport = this.reportedWindow !== window
     if (shouldReport) this.reportedWindow = window
     return { allowed: false, shouldReport, shouldClose: this.violations.hit() }
+  }
+
+  /** 本连接累计的违规次数（诊断用）。
+   *
+   * 单独成为一个出口，是因为「断开」那一下只发生一次，而排障时想知道的是**超了多少倍**：
+   * 只记 disconnected 与记 violations=37 在 journal 里的可用性不是一回事。 */
+  get violationCount(): number {
+    return this.violations.count
   }
 }
 

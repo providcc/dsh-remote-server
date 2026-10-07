@@ -40,8 +40,55 @@ function reportProblems(problems: ConfigProblem[]): boolean {
   return fatal
 }
 
+/**
+ * 命令行参数。**刻意只有一个退出码表**：0 = 正常（含优雅停机）、1 = 运行期致命、
+ * 2 = 命令行用法错。
+ *
+ * 为什么需要它（2026-10-07 补）：容器化之后，「哪一版在跑」这个问题第一次变得非启动
+ * 不可得——镜像里没有 package.json、没有 git、没有别的东西可问。于是
+ * `docker run … dsh-remote-relay --version` 是最省事也最不会出错的口子：它不监听端口、
+ * 不写状态文件、不需要 token。
+ *
+ * 旧行为是**静默忽略**任意参数（`node relay.mjs --whatever` 照常起服务），而容器编排里
+ * 传错 flag 的后果是「容器起来了但行为不是我要的」——最坏的一类。现在：不认识的参数回
+ * 一条用法行并 exit 2。
+ */
+function parseArgs(argv: readonly string[]): { help: boolean; version: boolean } | { error: string } {
+  const out = { help: false, version: false }
+  for (const arg of argv) {
+    if (arg === '--help' || arg === '-h') out.help = true
+    else if (arg === '--version' || arg === '-v') out.version = true
+    else return { error: `不认识的参数 ${JSON.stringify(arg)}` }
+  }
+  return out
+}
+
+const USAGE = [
+  '用法：relay.mjs [--version|-v] [--help|-h]',
+  '',
+  '  无参数       启动中继（读 DRC_* 环境变量；缺 DRC_HOST_TOKEN 拒绝启动）',
+  '  --version    打印版本号并退出 0（不监听端口、不需要 token）',
+  '  --help       打印本行并退出 0',
+  '',
+  '退出码：0 = 正常（含优雅停机）、1 = 运行期致命、2 = 命令行用法错。',
+].join('\n')
+
 async function main(): Promise<void> {
-  const { config, problems } = loadConfig(process.env, readVersion())
+  const cli = parseArgs(process.argv.slice(2))
+  if ('error' in cli) {
+    process.stderr.write(`[drc-relay] ${cli.error}\n\n${USAGE}\n`)
+    process.exit(2)
+  }
+  if (cli.help) {
+    process.stdout.write(`${USAGE}\n`)
+    process.exit(0)
+  }
+  const version = readVersion()
+  if (cli.version) {
+    process.stdout.write(`${version}\n`)
+    process.exit(0)
+  }
+  const { config, problems } = loadConfig(process.env, version)
   if (reportProblems(problems)) {
     process.exit(1)
   }

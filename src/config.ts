@@ -117,10 +117,38 @@ export const levelWeight = (level: LogLevel): number => LOG_LEVELS[level]
  * 退回默认值而不是返回 undefined，是为了让 `loadConfig` 保持全函数：哪怕带着 error，
  * 它也仍交出一份完整可用的 config（`main.ts` 见到 error 就 exit 1，用不到它）。
  */
+const DECIMAL_INTEGER_RE = /^[0-9]+$/
+
+/**
+ * 数值型环境变量：十进制正整数。三条边界都是 2026-10-07 审计补的，每条都对应一个
+ * 「照着文档配了、却没生效」或「悄悄变成另一个值」的真实场景：
+ *
+ * 1. **空串**：systemd EnvironmentFile 与 `docker run -e DRC_MAX_CONNS=` 都给得出空串，
+ *    旧写法静默退回默认值。照 SELF-HOSTING.md「建议收紧到 60s」写下 `DRC_PAIR_TTL_MS=`
+ *    的人**以为**收紧了，实际跑的是 120000，而日志一个字都没有。这里只**告警**不拒绝
+ *    启动：空串最常见的成因是部署脚本里变量没展开（${TTL} 为空），那台机器的其它配置
+ *    多半是好的，为它拒绝启动不划算——但必须让人听见。
+ * 2. **只认十进制字面量**：`Number()` 还接受 `0x3c`、`1e3`、`+60`、`" 60 "`，
+ *    它们 `Number.isInteger` 全都 true，于是 `DRC_MAX_CONNS=1e9` 能悄悄生效。
+ * 3. **上界**：`1e308` 也是整数，于是 `DRC_MAX_BUFFERED_BYTES=1e308` 等于把慢消费者
+ *    那个算力闸门取消掉，而启动时一声不吭。统一卡在 MAX_SAFE_INTEGER 就够——逐变量的
+ *    业务上界是另一回事，不在配置层猜。
+ */
 function integer(raw: string | undefined, fallback: number, name: string, problems: ConfigProblem[]): number {
-  if (raw === undefined || raw === '') return fallback
-  const n = Number(raw)
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+  if (raw === undefined) return fallback
+  if (raw === '') {
+    problems.push({
+      level: 'warn',
+      message: `${name} 被设成空串，按默认值 ${fallback} 处理（想覆盖请显式写值；想关掉请删掉这一行）`,
+    })
+    return fallback
+  }
+  if (!DECIMAL_INTEGER_RE.test(raw.trim())) {
+    problems.push({ level: 'error', message: `${name} 必须是十进制正整数，收到 ${JSON.stringify(raw)}` })
+    return fallback
+  }
+  const n = Number(raw.trim())
+  if (!Number.isSafeInteger(n) || n <= 0) {
     problems.push({ level: 'error', message: `${name} 必须是正整数，收到 ${JSON.stringify(raw)}` })
     return fallback
   }
@@ -132,7 +160,13 @@ function integer(raw: string | undefined, fallback: number, name: string, proble
  * 测试与容器发布端口都靠它，所以不能用上面那条 `> 0` 的规则一刀切。
  */
 function portNumber(raw: string | undefined, fallback: number, name: string, problems: ConfigProblem[]): number {
-  if (raw === undefined || raw === '') return fallback
+  // 空串与整数那条同义（「我没配」与「我配了个空」在 env 文件里长得一样），同样只告警：
+  // tests/config.test.mjs 把 DRC_PORT=''→8787 钉成了既定行为。
+  if (raw === '') {
+    problems.push({ level: 'warn', message: `${name} 被设成空串，按默认值 ${fallback} 处理` })
+    return fallback
+  }
+  if (raw === undefined) return fallback
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 0 || n > 65_535) {
     problems.push({ level: 'error', message: `${name} 必须是 0-65535 的整数，收到 ${JSON.stringify(raw)}` })
@@ -166,7 +200,12 @@ export function loadConfig(
   }
 
   const level = (env.DRC_LOG_LEVEL ?? 'info') as LogLevel
-  if (!(level in LOG_LEVELS)) {
+  // **Object.hasOwn，不是 `in`**（2026-10-07 审计修）。`in` 会走原型链，于是
+  // DRC_LOG_LEVEL=toString / constructor / valueOf / __proto__ / hasOwnProperty 这五个值
+  // **通过校验**，随后 levelWeight 返回函数或对象，log.ts 里的阈值比较变成 `20 < NaN` →
+  // 恒 false，于是**所有级别都打印**：包括 server.ts 那条带**真实 6 位配对码**的 debug 行。
+  // 运维以为自己设了 error、实际落了一地日志与配对码，而配置这一侧一声不吭。
+  if (!Object.hasOwn(LOG_LEVELS, level)) {
     problems.push({ level: 'error', message: `DRC_LOG_LEVEL 不认识的取值：${JSON.stringify(env.DRC_LOG_LEVEL)}` })
   }
 
@@ -244,6 +283,25 @@ export function loadConfig(
     stateFile: env.DRC_STATE_FILE ?? '',
     stateSaveMs: integer(env.DRC_STATE_SAVE_MS, 60_000, 'DRC_STATE_SAVE_MS', problems),
     version,
+  }
+
+  /**
+   * ping 分桶的自洽性（2026-10-07 审计补）。
+   *
+   * `pingBucketCount = round(pingIntervalMs / pingTickMs)`，而 server.ts 里 `max(1, …)` 兜底。
+   * 于是 `DRC_PING_TICK_MS` 大到与 interval 同量级时，分桶静默退化成 **1 个桶**——也就是
+   * 每 tick 对**全表**发 ping，正是 C1 拆分要治的那个形态（10k 连接、单轮 96 ms 阻塞
+   * 事件循环），而配置与日志上没有任何提示。判据是「一圈至少要能分出两桶」。
+   */
+  const pingBucketCount = Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs))
+  if (pingBucketCount < 2) {
+    problems.push({
+      level: 'warn',
+      message:
+        `DRC_PING_INTERVAL_MS=${config.pingIntervalMs} 与 DRC_PING_TICK_MS=${config.pingTickMs} 只分得出 ` +
+        '1 个 ping 桶：保活会退化成「每 tick 对所有连接各发一次 ping」（分桶之前的行为）。' +
+        '请让 tick ≤ interval/2。',
+    })
   }
   return { config, problems }
 }
