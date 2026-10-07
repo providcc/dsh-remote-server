@@ -167,7 +167,18 @@ function portNumber(raw: string | undefined, fallback: number, name: string, pro
     return fallback
   }
   if (raw === undefined) return fallback
-  const n = Number(raw)
+  // ⚠️ 这里**原来**是裸 `Number(raw)`，而上面那条 `integer()` 的注释明确说
+  // 「只认十进制字面量」（`Number()` 还接受 `0x3c` / `1e3` / `+60` / `" 60 "`）。
+  // 那条纪律没落到端口上：实测 `DRC_PORT=0x22` → 34、`1e3` → 1000、`+8787` → 8787，
+  // 三者的 `problems` 都是 0 条（同值喂 `DRC_MAX_CONNS` 则各报 1 条 error）。
+  //
+  // 严重度低——端口写错会直接 listen 失败而不是静默故障——但它是**同一份纪律的
+  // 一处漏网**，而配置层的价值恰恰在于"一处口径"。
+  if (!DECIMAL_INTEGER_RE.test(raw.trim())) {
+    problems.push({ level: 'error', message: `${name} 必须是十进制整数，收到 ${JSON.stringify(raw)}` })
+    return fallback
+  }
+  const n = Number(raw.trim())
   if (!Number.isInteger(n) || n < 0 || n > 65_535) {
     problems.push({ level: 'error', message: `${name} 必须是 0-65535 的整数，收到 ${JSON.stringify(raw)}` })
     return fallback
@@ -302,6 +313,40 @@ export function loadConfig(
         '1 个 ping 桶：保活会退化成「每 tick 对所有连接各发一次 ping」（分桶之前的行为）。' +
         '请让 tick ≤ interval/2。',
     })
+  }
+  /**
+   * ping 桶数的**上界**（2026-10-07 补，原来只有下界）。
+   *
+   * `server.ts` 照这个数 `Array.from({length: pingBucketCount}, () => new Set())`，
+   * 所以它不是一个"取整误差"而是**照单分配的对象数**。而 `integer()` 允许
+   * tick=1、interval 到 MAX_SAFE_INTEGER。
+   *
+   * 实测两档：
+   * - `tick=1, interval=3600000` → 360 万个 Set，createRelay 486ms、RSS 664MB；
+   * - `tick=1, interval=MAX_SAFE_INTEGER` → `RangeError: Invalid array length`，
+   *   而**到那一刻 loadConfig 报 0 条 problem** —— 异常发生在 createRelay 里，
+   *   早就跑完了配置校验，于是它一路冒到 main.ts 的 fatal 兜底：
+   *   **照文档把 tick 调细（那正是这个 knob 的用途）就启动即崩，且诊断里什么都没有。**
+   *
+   * 取 1024：默认 12 桶、典型调优 60~120 桶，它离危险区有两个数量级；
+   * 而 1024 个 Set 本身只占几 MB，夹回它不影响任何真实部署。
+   *
+   * ⚠️ 夹的是 **tick**（不是 interval）：保活周期是运维真正在意的量，
+   * 而 tick 只决定"分桶粒度"——把它抬到 interval/1024 之后实际分桶数
+   * 就是 1024，保活周期**一字不变**。夹 interval 才会改变行为。
+   */
+  const MAX_PING_BUCKETS = 1024
+  if (pingBucketCount > MAX_PING_BUCKETS) {
+    const minTickMs = Math.ceil(config.pingIntervalMs / MAX_PING_BUCKETS)
+    problems.push({
+      level: 'warn',
+      message:
+        `DRC_PING_TICK_MS=${config.pingTickMs} 与 DRC_PING_INTERVAL_MS=${config.pingIntervalMs} 会分出 ` +
+        `${pingBucketCount} 个 ping 桶（上限 ${MAX_PING_BUCKETS}）：进程会照这个数预分配同样多个桶，` +
+        `百万级时直接 OOM / 启动即崩。已把 tick 夹到 ${minTickMs}ms（保活周期不变，仍是 ` +
+        `${config.pingIntervalMs}ms，只分成 ${MAX_PING_BUCKETS} 桶轮转）。`,
+    })
+    config.pingTickMs = minTickMs
   }
   return { config, problems }
 }

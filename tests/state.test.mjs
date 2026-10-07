@@ -386,3 +386,82 @@ test('resync 的 kept 数的是"真的被留下的会话"，不是声明里的 i
   assert.equal(second.kept, 1, 'kept 必须等于实际留下的条数')
   assert.deepEqual(second.dropped, [b.conversationId])
 })
+
+// ── re-hello 换身份：旧 clientId 必须从**所有**会话的成员表里摘掉 ──────
+//
+// ## 缺陷形状
+//
+// `clientGone` **刻意不动成员表**——那是 D3 的机制（socket 断开时手机还可能用同一个
+// clientId 回来，会员关系必须留着）。
+//
+// 但 re-hello 是**换身份**而不是断开：那条 socket 从此不再服务旧身份，旧 clientId
+// 也永远不会回来。于是"留着成员"那条 D3 理由在这里不成立，而后果是：
+// 成员表里留着一个死成员 ⇒ `clients.size !== 0` ⇒ **`markEmpty` 永远不打点**
+// ⇒ `sweepEmpty`（P2-⑤，默认 30 分钟回收空会话）**完全失效**，
+// 唯一兜底是 7 天的 `sweepIdle`，`/healthz` 的 `conversations` 长期虚高。
+//
+// 而 server.ts 那一侧的注释明明写着「换 id 要向它所在会话的主机发 `peer-left`」
+// ——通知发了，**成员没摘**，而回收判据读的是成员表。
+
+test('leaveAll 把 clientId 从所有会话摘掉，并给空的那几条打上 emptySince', () => {
+  const clock = { now: 1_000 }
+  const state = new RelayState({ now: () => clock.now })
+  const host = new FakeSock('host')
+  state.attachHost('h1', host, 'my-macbook')
+  state.issuePair('h1', '111111', 180_000)
+  const conv1 = state.claim('111111', 'inst-1').conversationId
+  // ⚠️ 造"同一个 clientId 挂在多条会话上"这个状态**不能**靠连续 claim：
+  // `claim` 自己就先调了 `leaveAll`（复核 🟡7：重配必须摘干净），所以连续
+  // 两次 claim 之后 inst-1 只在最新那一条上。第一次写这条判据时用了连续 claim，
+  // 于是它红在一个与实现无关的地方（"conv1 的成员是 0"），而真正要验的
+  // "leaveAll 跨多条会话"根本没被测到。
+  // 正确形状是主机**重启续用**那条路：会话表在，主机 resync 声明"我仍持有这些"。
+  state.conversations.set('c_restored', {
+    hostId: 'h1',
+    clients: new Set(['inst-1', 'inst-2']),
+    seqHost: 0,
+    lastActivityAt: 1_000,
+  })
+  state.resync('h1', [conv1, 'c_restored'])
+  const conv3 = 'c_restored'
+
+  assert.equal(state.conversations.get(conv1).clients.size, 1)
+  assert.equal(state.conversations.get(conv3).clients.size, 2, '这一条有两个人')
+
+  const touched = state.leaveAll('inst-1')
+  assert.deepEqual(touched.sort(), [conv1, conv3].sort(), '它所在的两条都被摘到')
+  assert.equal(state.conversations.get(conv1).clients.size, 0)
+  assert.equal(state.conversations.get(conv3).clients.size, 1, '别人的会话里只摘自己')
+  // ⚠️ 这一条才是本缺陷的要害：空会话必须**打上计时**，否则回收判据看不见它。
+  assert.ok(state.conversations.get(conv1).emptySince !== undefined, '成员表空了却不打 emptySince：那条会话再也等不到回收')
+  assert.equal(
+    state.conversations.get(conv3).emptySince,
+    undefined,
+    '还有别的成员就不许打点（否则同一台手机重挂会被误回收）',
+  )
+})
+
+test('反向判据：leaveAll 不许删会话本身（会话归主机，主机可能还在上面跑）', () => {
+  const clock = { now: 1_000 }
+  const state = new RelayState({ now: () => clock.now })
+  const host = new FakeSock('host')
+  state.attachHost('h1', host, 'my-macbook')
+  state.issuePair('h1', '111111', 180_000)
+  const conv = state.claim('111111', 'inst-1').conversationId
+  state.leaveAll('inst-1')
+  assert.ok(state.conversations.has(conv), '会话必须留着：删了就是"手机每次回前台都要重扫"')
+  assert.equal(state.conversations.get(conv).hostId, 'h1', '归属不变')
+})
+
+test('反向判据：leaveAll 一个不在任何会话里的 clientId 是安全的空操作', () => {
+  const clock = { now: 1_000 }
+  const state = new RelayState({ now: () => clock.now })
+  const host = new FakeSock('host')
+  state.attachHost('h1', host, 'my-macbook')
+  state.attachClient('inst-1', new FakeSock('c1'))
+  state.issuePair('h1', '111111', 180_000)
+  const conv = state.claim('111111', 'inst-1').conversationId
+  assert.deepEqual(state.leaveAll('never-seen'), [], '不该凭空造出"受影响的会话"')
+  assert.equal(state.conversations.get(conv).emptySince, undefined, '空操作不许误打点')
+  assert.equal(state.conversations.get(conv).clients.size, 1, '也不许摘掉别人的')
+})

@@ -141,6 +141,16 @@ class Peer {
   }
 }
 
+/** 等一个条件成立（`Peer.until` 搜的是整个缓冲区，不能用来等"第 N 条"）。 */
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await sleep(20)
+  }
+  throw new Error('等待条件超时')
+}
+
 async function pairUp(ctx, { hostLabel = 'bins', clientId = 'inst-1', token = '123456' } = {}) {
   const host = await Peer.connect(ctx.url)
   host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, label: hostLabel })
@@ -1268,6 +1278,231 @@ test('转发的 enc 帧带 clientId，且 seq 原样透传（协议层 encToRela
     // 取值由 pairUp 的默认参数决定：'inst-1'。
     assert.equal(got.clientId, 'inst-1', '上行必须补 clientId —— 主机按它做 per-client 回调')
     assert.ok(!('seq' in got), '没带 seq 就不许凭空造一个：中继在��行方向不改它')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('防御纵深：绕过 loadConfig 直接构造 config 时，ping 桶数仍被夹住', async () => {
+  // 为什么需要这一条：`createRelay(config)` 是**导出的函数**，本仓的测试与将来的
+  // 嵌入方都可以拿一份手写的 config 直接调它 —— 那样就绕过了 `loadConfig` 的夹取。
+  // 而 `Array.from({length: 1e9})` 抛 RangeError：于是一个"配置写错"变成
+  // "进程起不来"，而 main.ts 只能报一句 fatal，连"是哪个配置项"都没有。
+  //
+  // 所以 server.ts 里必须**自己也夹一道**，取值与 config.ts 相同。
+  // 这条判据直接照那个形状造一份 config，不经过 loadConfig。
+  const { config } = loadConfig(
+    { ...process.env, DRC_HOST_TOKEN: TOKEN, DRC_PORT: '0', DRC_BIND: '127.0.0.1' },
+    'test',
+  )
+  config.pingTickMs = 1
+  config.pingIntervalMs = Number.MAX_SAFE_INTEGER
+  const relay = createRelay(config)
+  try {
+    // 只要求"构造得出、起得来"：不要求桶数等于某个具体值。
+    const { port } = await relay.startListening()
+    assert.ok(port > 0, '起得来')
+    // 顺带看一眼健康面没被这个配置搞坏（心跳那一路仍在跑）
+    assert.equal(relay.health().ok, true)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('观测面计数以**连接**为单位：一条连接连发 N 个 hello，计数只 +1', async () => {
+  // ## 缺陷形状
+  //
+  // `peerProtocols` 是 `/healthz` 的观测面，而它的注释承诺
+  // 「`peerProtocols.size === 0` 就是"当前没有对端"的判据，语义干净」。
+  //
+  // 原来每收一个 `hello` 就 +1，而 `close` 只 −1 —— 于是 re-hello（换身份，
+  // `releaseIdentityFor` 明确允许的设计内行为）N 次只抵消 1 次。
+  // 实测：一条连接 5 次 `hello(protocol=1)` 再关闭，`peerProtocolMin` 恒为 1、
+  // 永不回到 -1。而未认证对端单连接发 500 个 `hello`（帧闸 500/s 全放行）
+  // 就能把计数推高 500 —— 与「客户端身份键无界泄漏」那起事故同一形状，
+  // 而**这条注释恰好就在声明不会重犯**。
+  const ctx = await startRelay()
+  try {
+    const client = await Peer.connect(ctx.url)
+    ctx.open.push(client)
+    for (let i = 0; i < 5; i++) {
+      client.send({ t: 'hello', role: 'client', protocol: 1, clientId: `inst-${i}` })
+      await client.until((f) => f.t === 'hello-ok')
+    }
+    // ⚠️ 必须先断言**连着的时候**计数就是 1：只断言"断开后归零"的话，
+    // 一段"每次 +1 然后每次 -1"的实现也能过（那是把闩锁换成配对增减）——
+    // 而它对"未认证对端单连接刷 500 个 hello 把计数推高"这件事完全无效。
+    // 症状上那两者只在"断开后"看起来一样，而攻击面完全不同。
+    const during = ctx.relay.health()
+    assert.equal(during.peerProtocolMax, 1, `一条连接 5 次 hello，计数必须是 1 而实得 ${during.peerProtocolMax}`)
+    assert.equal(during.protocolMin, 1, `实得 ${JSON.stringify(during)}`)
+
+    // 关掉之后必须回到"没有对端"——这才是那句注释承诺的东西。
+    client.ws.close()
+    await sleep(150)
+    const after = ctx.relay.health()
+    assert.equal(after.peerProtocolMin, -1, '一条连接 5 次 hello 之后只该减 1 次，归零')
+    assert.equal(after.peerProtocolMax, -1, `实得 ${JSON.stringify(after)}：计数表没有归零`)
+    assert.equal(after.peersNoProtocol, 0)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('反向判据：没报版本的连接也只记一次（peersNoProtocol 与上面同口径）', async () => {
+  // 上面那条只覆盖"报了版本的连接"。而**没报版本**的连接 `peer.protocol` 恒为
+  // undefined，它同样要往 peersWithoutProtocol 里记一次——所以不能用
+  // `peer.protocol === undefined` 当"没记过"的判据。
+  const ctx = await startRelay()
+  try {
+    const client = await Peer.connect(ctx.url)
+    ctx.open.push(client)
+    for (let i = 0; i < 4; i++) {
+      client.send({ t: 'hello', role: 'client', clientId: `nover-${i}` })
+      await client.until((f) => f.t === 'hello-ok')
+    }
+    assert.equal(ctx.relay.health().peersNoProtocol, 1, '一条没报版本的连接只该计 1')
+    client.ws.close()
+    await sleep(150)
+    assert.equal(ctx.relay.health().peersNoProtocol, 0, '断开后必须归零')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('同一条连接从不报版本改成报版本：peersNoProtocol 必须减掉（否则观测面虚高）', async () => {
+  // 这一条钉的是**版本切换**那条支的减法：一条连接先不报协议、再报 1，
+  // 它在计数表里的位置必须从 `peersNoProtocol` 挪到 `peerProtocols`，
+  // 而不是两处各 +1。
+  //
+  // 少了那半句减法，症状是"peersNoProtocol 明明断了连接还 > 0"，
+  // 而它恰好是回答"是不是有老版本客户端还在用"的那个数 —— 一个**假的高**，
+  // 排错时会让人去追一个不存在的兼容性问题。
+  //
+  // ⚠️ 方向只能是"不报 → 报"：`PROTOCOL_VERSION` 就是 1，而版本闸会拒掉
+  // 大于它的值（实测 protocol:2 直接被 `acceptProtocol` 挡掉，连 hello-ok
+  // 都没有），所以"报 1 → 报 2"这条路径**不可达**，拿它写判据就是一条
+  // 恒红或恒绿的假判据。（第一次写的就是这个，变异验证时它恒绿——
+  // 因为连 `else if` 都没进去。）
+  const ctx = await startRelay()
+  try {
+    const client = await Peer.connect(ctx.url)
+    ctx.open.push(client)
+    client.send({ t: 'hello', role: 'client', clientId: 'sw1' }) // 不带 protocol
+    await client.until((f) => f.t === 'hello-ok')
+    assert.equal(ctx.relay.health().peersNoProtocol, 1, '先确认它进了"没报版本"那一格')
+    assert.equal(ctx.relay.health().peerProtocolMax, -1, '此刻没有任何对端报过版本')
+
+    // ⚠️ 这里**不能**用 `until((f) => f.t === 'hello-ok')`：那个助手是
+    // `frames.find(match)`，第一条 hello-ok 还在缓冲区里，于是它**立刻**返回
+    // ——而第二个 hello 此时可能还没被服务端处理。症状是"health 读到旧值"，
+    // 与实现无关。正确形状是数 hello-ok 的条数。
+    const before2 = client.frames.filter((f) => f.t === 'hello-ok').length
+    client.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'sw2' })
+    await waitFor(() => client.frames.filter((f) => f.t === 'hello-ok').length > before2)
+
+    const during = ctx.relay.health()
+    assert.equal(during.peersNoProtocol, 0, `它已经不报版本了，这一格必须减掉，实得 ${during.peersNoProtocol}`)
+    assert.equal(during.peerProtocolMax, 1, '同时进了"报了版本"那一格')
+    assert.equal(during.peerProtocolMin, 1)
+
+    client.ws.close()
+    await sleep(150)
+    const after = ctx.relay.health()
+    assert.equal(after.peerProtocolMin, -1, '断开后必须完全归零')
+    assert.equal(after.peersNoProtocol, 0, `实得 ${JSON.stringify(after)}`)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('re-hello 换身份：旧 clientId 必须从会话成员表里摘掉（否则空会话回收完全失效）', async () => {
+  // 上面那条 state 级的判据钉的是 `leaveAll` 本身。这一条钉的是**接线**：
+  // `releaseIdentityFor` 原来只走 `clientGone`（它**刻意不动成员表**，那是 D3 的
+  // 机制：socket 断开时手机还可能用同一个 clientId 回来）。
+  //
+  // 但 re-hello 是**换身份**而不是断开——那条 socket 从此不再服务旧身份，
+  // 旧 clientId 永远不会回来。于是"留着成员"那条 D3 理由在这里不成立，
+  // 后果是：成员表里留着一个死成员 ⇒ `markEmpty` 永远不打点 ⇒
+  // `sweepEmpty`（默认 30 分钟回收空会话）**完全失效**，唯一兜底是 7 天的空闲 TTL。
+  //
+  // 而 `releaseIdentityFor` 上方那段注释明明写着「换 id 要向它所在会话的主机发
+  // `peer-left`」——通知发了，**成员没摘**，而回收判据读的是成员表。
+  const ctx = await startRelay()
+  try {
+    const { host, client, conversationId } = await pairUp(ctx)
+    const before = ctx.relay.state.conversations.get(conversationId)
+    assert.equal(before.clients.size, 1, '刚配对上：这一条有一个成员')
+
+    // 连发 3 次换 id 的 hello（模拟小程序重新安装/换设备后用新 installId 回来）
+    for (let i = 0; i < 3; i++) {
+      const n = client.frames.filter((f) => f.t === 'hello-ok').length
+      client.send({ t: 'hello', role: 'client', protocol: 1, clientId: `swapped-${i}` })
+      await waitFor(() => client.frames.filter((f) => f.t === 'hello-ok').length > n)
+    }
+
+    const conv = ctx.relay.state.conversations.get(conversationId)
+    assert.ok(conv, '会话本身必须留着（它归主机，主机可能还在上面跑）')
+    assert.equal(
+      conv.clients.size,
+      0,
+      `成员表里还留着 ${[...conv.clients].join(',')}：旧 clientId 已经不会回来了，` +
+        '而它让 markEmpty 永远不打点 ⇒ sweepEmpty（30 分钟回收空会话）完全失效',
+    )
+    assert.ok(
+      conv.emptySince !== undefined,
+      '空会话必须打上回收计时：这是 sweepEmpty 唯一的入口，不打点就等于永不过期',
+    )
+    // 顺带确认主机侧**确实**收到了通知（那段注释承诺的动作本来就做了）
+    const left = host.frames.filter((f) => f.t === 'peer-left')
+    assert.ok(left.length >= 1, '主机必须收到 peer-left：换身份了，它不该再往旧手机发密文')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('配对表满的告警只记一次（逐帧判定的路径不许逐帧写日志）', async () => {
+  // 三道闩锁里原本有 `notedFrameFlood` / `notedNonMember` / `pairBudgetWarnedAt`，
+  // 而"配对表满"这一条**逐帧**判定（表满时每次 issuePair 都回 full:true）却是
+  // 裸 `log.warn` —— 实测 maxPendingPairs=1 + 400 个 pair-begin = **400 行** journald。
+  //
+  // 为什么这条比"日志太多"严重：journald 的条数额度被打满时，中继**自己的**
+  // 诊断日志会被一起抑制 —— 正是 log.ts 文件头记录的那起事故的同一通路。
+  //
+  // 判据形状：不数日志行（Log 是 silent 级别、且本仓不导出日志收集口），
+  // 而是**断言语义**：那一批 400 个 pair-begin 全都仍然收到 `pair_table_full`
+  // 错误帧（闩锁只限日志，不限协议响应——把它一起限掉就成了另一个缺陷）。
+  // ⚠️ 上限取 **1**，而这依赖一条容易看漏的语义：`countClaimablePairs()`
+  // **不数 used 的条目**，而 `pairUp` 会把它自己那张码认领掉（于是它变 used、
+  // 不再占额度）。所以顺序是：pairUp 占 0 个可认领槽 → `000000` 填满那 1 个
+  // → 之后每一发都 full。
+  //
+  // 第一次写这条判据时设成 2，于是多出**一个**空槽、只有第 60 发才被拒
+  // （59/60）——症状是"判据差一条"，而根因是额度计算里那条"不数 used"。
+  const ctx = await startRelay({ DRC_MAX_PENDING_PAIRS: '1' })
+  try {
+    const { host } = await pairUp(ctx)
+    host.ws.send(JSON.stringify({ t: 'pair-begin', pairingToken: '000000' }))
+    await host.until((f) => f.t === 'pair-ready' && f.pairingToken === '000000')
+    // 灌 60 个：表已经满了，每一个都该回错误帧。
+    // ⚠️ token 必须两两不同 —— 撞上就意味着那一发拿到的是"已存在那张码"的
+    // 语义（pair-ready 而不是 pair_table_full），而判据数的是错误帧条数，
+    // 于是它红在一个与闩锁无关的地方。（6 位码空间，'9xxxxx' 够用。）
+    const FLOOD = 60
+    for (let i = 0; i < FLOOD; i++) {
+      host.ws.send(JSON.stringify({ t: 'pair-begin', pairingToken: `9${String(i).padStart(5, '0')}` }))
+    }
+    const deadline = Date.now() + 2000
+    let seen = 0
+    while (Date.now() < deadline && seen < FLOOD) {
+      seen = host.frames.filter((f) => f.t === 'error' && f.code === 'pair_table_full').length
+      if (seen < FLOOD) await sleep(20)
+    }
+    assert.equal(
+      seen,
+      FLOOD,
+      `只收到 ${seen}/${FLOOD} 条 pair_table_full：闩锁必须只限**日志**，协议响应一个都不许少（少一个就是新缺陷）`,
+    )
   } finally {
     await ctx.close()
   }

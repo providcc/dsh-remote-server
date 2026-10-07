@@ -108,6 +108,8 @@ interface Peer {
   notedFrameFlood: boolean
   /** 同上：`enc from non-member` 一条连接只记一次。 */
   notedNonMember: boolean
+  /** 配对表满的告警只记一次（逐帧判定，见 handlePairBegin）。 */
+  notedPairTableFull: boolean
   /** 同上：全局配对配额用尽那条 warn，每秒最多一行（0 = 还没记过）。 */
   pairBudgetWarnedAt: number
   alive: boolean
@@ -127,6 +129,18 @@ interface Peer {
    * 事**写成了理由：业务帧从来不跑那道闸，所以不存在"被当成 1"这回事。
    */
   protocol?: number
+  /**
+   * 这条连接**已经往 `peerProtocols` / `peersWithoutProtocol` 里记过一次**没有。
+   *
+   * 为什么需要它：观测面的计数必须以**连接**为单位（`close` 天然每条连接减一次），
+   * 而 `hello` 可以来很多次（re-hello 是设计内行为，见 `releaseIdentityFor`）。
+   * 没有这个闩锁时每收一个 `hello` 就 +1，于是 N 次 hello 只抵消 1 次断开，
+   * `peerProtocols.size === 0`（"当前没有对端"）这条判据永久失效。
+   *
+   * 它与 `protocol !== undefined` **不是一回事**：一个**没报版本**的连接
+   * `protocol` 恒为 undefined，而它同样要往 `peersWithoutProtocol` 里记一次。
+   */
+  countedProtocol: boolean
 }
 
 export interface RelayHandle {
@@ -269,7 +283,17 @@ export function createRelay(config: RelayConfig): RelayHandle {
    * 主要来自遍历本身，那样等于没改。
    * 用 Set 而不是数组：`close` 时要按连接摘除，Set 的 delete 是 O(1)。
    */
-  const pingBucketCount = Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs))
+  // `pingBucketCount` 在 config.ts 里已经夹到 ≤1024 并告警；这里再夹一道是
+  // **防御纵深**：`createRelay(config)` 是个导出的函数，测试与将来的嵌入方可以
+  // 直接构造一份 config 绕过 `loadConfig`（本仓的测试就这么干）。
+  // 而 `Array.from({length: 1e9})` 抛的是 RangeError —— 那会让一个"配置写错"
+  // 变成"进程起不来"，而 `main.ts` 只能报一句 fatal。
+  // 取值与 config.ts 相同（1024），两处的一致由 `config.test.mjs` 那条判据守住。
+  const MAX_PING_BUCKETS = 1024
+  const pingBucketCount = Math.min(
+    MAX_PING_BUCKETS,
+    Math.max(1, Math.round(config.pingIntervalMs / config.pingTickMs)),
+  )
   const pingBuckets: Array<Set<Peer>> = Array.from({ length: pingBucketCount }, () => new Set<Peer>())
   let nextPingBucket = 0
   let currentPingBucket = 0
@@ -446,6 +470,29 @@ export function createRelay(config: RelayConfig): RelayHandle {
       for (const notice of state.clientGone(old, peer.ws)) {
         sendTo(state.hostSocket(notice.conversationId), peerLeftFrame(notice.conversationId, notice.clientId))
       }
+      /**
+       * ⚠️ **再把旧 clientId 从所有会话的成员表里摘掉**（2026-10-07 补）。
+       *
+       * `clientGone` **刻意不动成员表**——那是 D3 的机制：socket 断开时手机还可能
+       * 用同一个 clientId 回来，会员关系必须留着。
+       *
+       * 但 re-hello 是**换身份**，不是断开：这条 socket 从此不再服务旧身份，
+       * 旧 clientId 也**永远不会回来**（新 clientId 已经在另一条会话上了）。
+       * 于是"留着成员"那条 D3 理由在这里不成立，而后果是：
+       * 实测配对后（成员 `mem0`）连发 4 次换 id 的 hello → 成员恒为 `mem0`、
+       * `emptySince` 恒为 undefined ⇒ **`sweepEmpty` 完全失效**（那条 P2-⑤ 默认
+       * 30 分钟回收空会话），唯一兜底是 7 天的 `sweepIdle`，`/healthz` 的
+       * `conversations` 长期虚高。
+       *
+       * 上面那段 `server.ts` 的注释说"换 id 要向它所在会话的主机发 `peer-left`"
+       * ——通知发了，**成员没摘**，而回收判据读的是成员表。
+       *
+       * 复用 `leaveAll` 而不是新写一个：它已经带 `markEmpty`，而那正是让
+       * `sweepEmpty` 重新开始计时的唯一入口。
+       */
+      for (const conversationId of state.leaveAll(old)) {
+        state.touchConversation(conversationId)
+      }
       log.info('client identity released by re-hello', { clientId: old })
     }
     if (peer.role === 'host' && peer.hostId) {
@@ -461,9 +508,32 @@ export function createRelay(config: RelayConfig): RelayHandle {
     // 让后续那些不带该字段的帧仍按对端的真实版本判定（见 `Peer.protocol` 的注释）。
     // 记 `frame.protocol` 而不是判定的结果：不报字段的老端点在闸里按 1 处理，
     // 这里也要存成 `undefined` 而不是 1 —— 否则 `/healthz` 会把"没报"说成"报了 1"。
+    //
+    // ⚠️ 计数**只在第一次 hello 时记**（2026-10-07 修）。re-hello 是设计内行为
+    // （换身份，见 releaseIdentityFor），而原来每收一个 `hello` 就 +1、`close` 只 −1
+    // —— 于是 N 次 hello 只抵消 1 次，`peerProtocols.size === 0`（"当前没有对端"）
+    // 这条判据**永久失效**，未认证对端单连接发 500 个 hello（帧闸 500/s 全放行）
+    // 就能把计数推高 500。
+    //
+    // 正确形状是"**连接**记一次"，而 `close` 天然每条连接只减一次 —— 两边同口径。
+    // 版本变了（re-hello 报了另一个 protocol）时先减旧的那个再加新的，那才是
+    // "这条连接此刻报的版本"在计数表里的位置。
+    if (peer.protocol === undefined && !peer.countedProtocol) {
+      peer.countedProtocol = true
+      if (frame.protocol === undefined) peersWithoutProtocol++
+      else peerProtocols.set(frame.protocol, (peerProtocols.get(frame.protocol) ?? 0) + 1)
+    } else if (peer.protocol !== frame.protocol) {
+      // 同一条连接换了版本：把旧的那个减掉。
+      if (peer.protocol === undefined) peersWithoutProtocol = Math.max(0, peersWithoutProtocol - 1)
+      else {
+        const left = (peerProtocols.get(peer.protocol) ?? 1) - 1
+        if (left > 0) peerProtocols.set(peer.protocol, left)
+        else peerProtocols.delete(peer.protocol)
+      }
+      if (frame.protocol === undefined) peersWithoutProtocol++
+      else peerProtocols.set(frame.protocol, (peerProtocols.get(frame.protocol) ?? 0) + 1)
+    }
     peer.protocol = frame.protocol
-    if (frame.protocol === undefined) peersWithoutProtocol++
-    else peerProtocols.set(frame.protocol, (peerProtocols.get(frame.protocol) ?? 0) + 1)
     if (frame.role === 'host') {
       if (!config.hostToken) {
         sendError(peer, 'internal', 'relay has no host token configured')
@@ -528,7 +598,15 @@ export function createRelay(config: RelayConfig): RelayHandle {
     if (!issued.conflict) {
       if (!issued.ok) {
         sendError(peer, 'pair_table_full')
-        log.warn('pair table full', { hostId: peer.hostId })
+        // ⚠️ **只记一次**（2026-10-07 补，与 notedFrameFlood / notedNonMember 同纪律）。
+        // 这条判定是**逐帧**的（表满时每次 issuePair 都回 full），而帧闸 500/s 全放行
+        // ⇒ 实测一条已认证主机连发 400 个 pair-begin 就是 **400 行** journald。
+        // 而 journald 的条数额度被打满时，中继**自己的**诊断日志会被一起抑制 ——
+        // 正是 log.ts 文件头记录的那起事故的同一通路。
+        if (!peer.notedPairTableFull) {
+          peer.notedPairTableFull = true
+          log.warn('pair table full', { hostId: peer.hostId })
+        }
         return
       }
     } else {
@@ -932,9 +1010,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // 一条未认证连接就能把 journald 的条数额度吃干净（见各自注释）。
       notedFrameFlood: false,
       notedNonMember: false,
+      notedPairTableFull: false,
       pairBudgetWarnedAt: 0,
       backpressure: new BackpressureGate(),
       alive: true,
+      // 观测面计数的闩锁（见 Peer.countedProtocol）：连接为单位，不是 hello 为单位。
+      countedProtocol: false,
       // 轮转序号取模分配：**均匀是刻意的**。哪怕重启风暴里 10k 条连接在几十秒内
       // 全建起来，它们也会摊到所有桶上；若改成"分给下一个将要轮到的桶"，
       // 风暴会把它们全塞进同一两个桶，等于把刚拆掉的突发又造回来（C7 的场景）。
