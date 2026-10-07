@@ -637,7 +637,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // 内部原因 `rate_limited` 直接写进 pair-fail —— 那会把英文字面量弹给用户。
       // 对用户有意义且成立的只有"这张码现在配不上"，真正的限速原因进日志给运维。
       counters.rejectedPairs += 1
-      sendToPeer(peer, pairFailFrameOf('invalid_or_expired'))
+      sendToPeer(peer, pairFailFrameOf('invalid_or_expired', frame.pairingToken))
       // **每秒最多一行**（见 Peer 上那三道闩锁）。旧写法逐帧记：配额用尽的那一秒里
       // 单条连接能写 ~480 行，200 条连接就是 ~10 万行/秒 —— journald 按条数额度
       // （RateLimitBurst=10000）打满之后，**中继自己的正常诊断日志被一起丢掉**，
@@ -656,7 +656,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
     if (!claimed.ok) {
       peer.pairAttempts += 1
       counters.rejectedPairs += 1
-      sendToPeer(peer, pairFailFrameOf(claimed.reason))
+      sendToPeer(peer, pairFailFrameOf(claimed.reason, frame.pairingToken))
       log.info('pair failed', {
         clientId: peer.clientId,
         reason: claimed.reason,
@@ -1083,6 +1083,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
         switch (verdict.reason) {
           case 'bad_pair_claim':
             counters.rejectedPairs += 1
+            // ⚠️ 这一支**刻意不带 token**：帧形状已经不合法（缺 pairingToken 或
+            // 类型不对），所以从它身上读出来的任何 token 都不可信 —— 而
+            // 主机侧会拿它去作废那一张码，发错就是误伤一张有效的码。
+            // 宁可让主机退回"作废展示中的那张"（它至少知道自己那张是谁）。
             sendToPeer(peer, pairFailFrameOf('invalid_or_expired'))
             return
           case 'bad_pair_begin':

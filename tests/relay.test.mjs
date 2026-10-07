@@ -1507,3 +1507,57 @@ test('配对表满的告警只记一次（逐帧判定的路径不许逐帧写�
     await ctx.close()
   }
 })
+
+test('pair-fail 必须带上**是哪一张**码失败的（主机靠它避免作废错的那张）', async () => {
+  // 主机侧的处理是"作废失败的那张码"，而这一帧原先只有 `reason` ——
+  // 于是它只能拿"当前展示的那张"顶罪。多码并存时那会**作废错的那张**：
+  // 屏幕上是码 B（完全有效），用户扫了一张早就过期的码 A → B 被丢弃，
+  // B 的 PSK 没了 → 那条配对通道作废。
+  //
+  // 而主机侧会**补一张新码**（onPairFail 的最后一句），所以用户看到的是
+  // 「我扫的码没用，主机又换了一张」——而他刚扫的那张其实是好的。
+  const ctx = await startRelay()
+  try {
+    const { host, client } = await pairUp(ctx)
+    // 主机手上有一张**有效**的码（123456，pairUp 发的）
+    assert.ok(host.frames.some((f) => f.t === 'pair-ready'), '夹具自检：主机手上有码')
+
+    // 客户端报一张**根本不存在**的码
+    client.send({ t: 'pair-begin-client', pairingToken: '999999' })
+    const fail = await client.until((f) => f.t === 'pair-fail')
+    assert.equal(fail.reason, 'invalid_or_expired')
+    assert.equal(
+      fail.pairingToken,
+      '999999',
+      '必须点名是哪一张失败的：主机靠它避免把「当前展示的那张」误当成废码',
+    )
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('形状不合的 pair-begin-client：pair-fail **不带** token（不可信的东西不许发）', async () => {
+  // 这一支是"形状就不合法"（缺 pairingToken / 类型不对），所以从帧里读出来的
+  // 任何 token 都不可信 —— 而主机侧会拿它去作废一张码，发错就是误伤。
+  // 宁可让主机退回"作废展示中的那张"（它至少知道自己那张是谁）。
+  //
+  // 这与上一条**方向相反**而两条都要在：一条保证"能带就带"，
+  // 这一条保证"不能带就不带"。
+  const ctx = await startRelay()
+  try {
+    const client = await Peer.connect(ctx.url)
+    ctx.open.push(client)
+    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    await client.until((f) => f.t === 'hello-ok')
+    client.send({ t: 'pair-begin-client' }) // 缺 pairingToken
+    const fail = await client.until((f) => f.t === 'pair-fail' || f.t === 'error')
+    assert.equal(fail.t, 'pair-fail', '形状错仍然回 pair-fail 而不是 bad_frame（F6）')
+    assert.equal(
+      fail.pairingToken,
+      undefined,
+      '形状不合时那个 token 不可信，绝不能发给主机去作废一张码',
+    )
+  } finally {
+    await ctx.close()
+  }
+})
