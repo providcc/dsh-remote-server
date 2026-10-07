@@ -20,8 +20,6 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import {
-  base64Text,
-  parseEndpointFrame,
   type EndpointFrame,
   type ErrorCode,
   type RelayFrame,
@@ -31,7 +29,9 @@ import { negotiateProtocol, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION } from 'dsh
 import { wantsRetryAfter } from 'dsh-remote-wire/errors'
 import {
   encBatchToClient,
+  encBatchToRelay,
   encToClient,
+  encToRelay,
   helloOkForClient,
   helloOkForHost,
   makeError as makeErrorFrame,
@@ -42,6 +42,7 @@ import {
   peerLeft as peerLeftFrame,
   pong as pongFrameOf,
 } from 'dsh-remote-wire/outbound'
+import { classifyEndpointFrameText } from 'dsh-remote-wire/classify'
 import type { RelayConfig } from './config.js'
 import { BackpressureGate, Budget, FrameRateGate } from './limits.js'
 import { Log, REDACTED } from './log.js'
@@ -78,32 +79,6 @@ const DRAIN_MS = 1_500
  * 天然有界。
  */
 const RESYNC_PERSIST_MIN_GAP_MS = 2_000
-
-/**
- * 协议里"存在"的全部帧名（wire 的 F1 冻结表 + `resync`/`session-leave` 两条后加的）。
- *
- * 只用于一处：把"帧名根本不认识"（对端版本不对 → unknown_frame）与"名字认识但形状
- * 不合法"（对端发了坏数据 → bad_frame）分开。列表类型上有约束——只能写进
- * `EndpointFrame` / `RelayFrame` 两个 union 里真实存在的 `t`，写错一个字母就编译不过。
- */
-const KNOWN_FRAME_NAMES: ReadonlySet<string> = new Set<EndpointFrame['t'] | RelayFrame['t']>([
-  'hello',
-  'pair-begin',
-  'pair-begin-client',
-  'resync',
-  'enc',
-  'enc-batch',
-  'session-leave',
-  'ping',
-  'hello-ok',
-  'pair-ready',
-  'paired',
-  'pair-fail',
-  'peer-joined',
-  'peer-left',
-  'error',
-  'pong',
-])
 
 interface Peer {
   ws: WebSocket
@@ -667,13 +642,14 @@ export function createRelay(config: RelayConfig): RelayHandle {
         sendError(peer, 'host_unavailable')
         return
       }
-      sendTo(host, {
-        t: 'enc',
-        sessionId: frame.sessionId,
-        seq: frame.seq,
-        clientId: peer.clientId,
-        ciphertext: frame.ciphertext,
-      })
+      // ⚠️ `encToRelay` 的参数表里**没有 clientId**，而这一帧必须带
+      // （主机按它做 per-client 回调，见 relay.ts 的 onCommand 第三参）。
+      // 协议层的构造器是给**端点**用的——端点发的 enc 帧不带 clientId，
+      // 那是中继转发时才补的，属于中继自己的转发语义。所以这里扩一个可选参数：
+      // 它在 schema 里本来就是可选字段（`frames.ts` 的 encFrame.clientId），
+      // 而"手写 `{t:'enc',…}`"意味着 sessionId/seq/ciphertext 三个字段名
+      // 在本文件里又抄了一遍——改字段不会有编译错误。
+      sendTo(host, encToRelay(frame.sessionId, frame.seq, frame.ciphertext, peer.clientId))
       state.touchConversation(frame.sessionId)
       return
     }
@@ -707,7 +683,11 @@ export function createRelay(config: RelayConfig): RelayHandle {
         sendError(peer, 'host_unavailable')
         return
       }
-      sendTo(host, { t: 'enc-batch', sessionId: frame.sessionId, items: frame.items })
+      // ⚠️ 批量帧**不带** clientId，而单帧带（`encToRelay` 那条）。这不是漏写：
+      // `encBatchFrame` 的 schema 里压根没有 `clientId` 字段（F 契约），
+      // 中继要加就得改协议，而批量帧的用途是"一帧装多条正文"，
+      // 主机按会话而非按客户端处理它。加字段前先确认主机侧真的需要 per-client 语义。
+      sendTo(host, encBatchToRelay(frame.sessionId, frame.items))
       state.touchConversation(frame.sessionId)
       return
     }
@@ -964,16 +944,19 @@ export function createRelay(config: RelayConfig): RelayHandle {
     bucketAt(peer.pingBucket).add(peer)
     ws.on('message', (raw: RawData, isBinary: boolean) => {
       const now = Date.now()
-      const verdict = peer.rate.check(now)
-      if (!verdict.allowed) {
+      // 两个判定不共用一个变量名：帧闸那个叫 rateVerdict，帧判定那个叫 verdict。
+      // 原来它们都叫 `verdict`，靠 `const` 的块级作用域各自成立——但同一个
+      // 回调里两个同名 const 相邻，读的人会以为下面 `!verdict.ok` 判的是帧闸。
+      const rateVerdict = peer.rate.check(now)
+      if (!rateVerdict.allowed) {
         // 帧闸是**固定 1 秒窗口**（见 FrameRateGate），所以"还要等多久"就是这一秒的余量。
         // 带一个具体的数（而不是让手机自己猜）正是 §12.2 E2 要的：端点据此退避一轮就够，
         // 不必从一个编出来的常数开始试。下限取 1ms——`retryAfterMs` 必须是正整数，
         // 恰好卡在秒边界时 `1000 - (now % 1000)` 会是 1000，不会到 0，但这条夹取是防
         // 将来窗口变短时静默发出 0 或负数（那会让 makeError 直接抛）。
         const retryAfterMs = Math.max(1, 1000 - (now % 1000))
-        if (verdict.shouldReport) sendError(peer, 'rate_limited', undefined, undefined, retryAfterMs)
-        if (verdict.shouldClose) {
+        if (rateVerdict.shouldReport) sendError(peer, 'rate_limited', undefined, undefined, retryAfterMs)
+        if (rateVerdict.shouldClose) {
           // 只记一次（见 Peer 上那三道闩锁的注释）：close 是优雅的，对端在这段
           // 窗口里继续灌帧，旧写法每帧一行，实测单连接 1.1s / 29.9 万行。
           if (!peer.notedFrameFlood) {
@@ -1000,56 +983,58 @@ export function createRelay(config: RelayConfig): RelayHandle {
         sendError(peer, 'bad_frame', 'unsupported frame payload type')
         return
       }
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(text)
-      } catch {
-        sendError(peer, 'bad_json')
-        return
+      /**
+       * **七步分级判定委托协议层**（2026-10-07 接线）。
+       *
+       * 原来这里是本文件里内联的一整套：自己 `JSON.parse`、手抄一份帧名表、
+       * 自己分"名字不认识（unknown_frame）/ 名字对但形状坏（bad_frame）"、
+       * 再自己写一遍密文字符集预检。同一份协议知识在本文件里出现了两次
+       * （帧名表 + 字符集函数），改协议时要人肉同步两处，而漏掉任何一处都不会编译失败。
+       *
+       * `classifyEndpointFrameText` 把它们收成**一个返回值**：这里只剩
+       * "照 reason 发对应的 error"（映射表写在 classify.ts 的文件头）。
+       * 两条配对特例也归它管——`pair-begin-client` 的形状错误必须回
+       * `pair-fail{invalid_or_expired}` 而不是 `bad_frame`，因为小程序只认那四个
+       * reason 的中文文案（F6），一个 `error{bad_frame}` 对它就是一句看不懂的话。
+       */
+      const verdict = classifyEndpointFrameText(text)
+      if (!verdict.ok) {
+        switch (verdict.reason) {
+          case 'bad_pair_claim':
+            counters.rejectedPairs += 1
+            sendToPeer(peer, pairFailFrameOf('invalid_or_expired'))
+            return
+          case 'bad_pair_begin':
+            // 这是**主机**的 bug，说给主机听更准确。
+            sendError(peer, 'bad_pair')
+            return
+          case 'bad_ciphertext':
+            // Buffer 对非法 base64 是静默丢弃，所以这层必须在转发前把关。
+            sendError(peer, 'bad_frame', 'ciphertext must be standard base64')
+            return
+          case 'unknown_frame':
+            // "对端版本不认识这个帧"。判据是"`t` 是不是协议里已存在的帧名"，
+            // 而那张表现在是 registry 的注册表（带编译期断言），不再是本文件的手抄。
+            sendError(peer, 'unknown_frame', verdict.frameType, verdict.frameType)
+            return
+          case 'bad_frame':
+            // "名字对、形状坏"。帧名同时给 host（英文细节）与用户（`userHint`）：
+            // "是哪条帧坏了"两边都用得上，而英文那句只给 host（见 sendError 的注释）。
+            sendError(
+              peer,
+              'bad_frame',
+              `frame "${verdict.frameType}" has an invalid shape`,
+              verdict.frameType,
+            )
+            return
+          case 'not_object':
+          case 'no_frame_type':
+            // JSON 解析失败、顶层不是对象、或没有字符串 `t`——对端发的压根不是一帧。
+            sendError(peer, 'bad_json')
+            return
+        }
       }
-      // 配对码格式不对时给对端一个"用得上的"错误：客户端会把 pair-fail 的 reason
-      // 翻成中文文案（F6），而 error{unknown_frame} 只会是一句看不懂的提示。
-      //
-      // **只解析一次**（2026-10-07 修）：这里与下面那条 schema 判定原来各调一次
-      // `parseEndpointFrame`，同一条坏帧要解析两遍。zod 解析是这条热路径上最贵的一步，
-      // 而"两遍"没有任何额外信息——两处读的是同一个对象、同一个 schema。
-      const declaredType = (parsed as { t?: unknown } | null)?.t
-      const frame = parseEndpointFrame(parsed)
-      if (!frame) {
-        if (declaredType === 'pair-begin-client') {
-          counters.rejectedPairs += 1
-          sendToPeer(peer, pairFailFrameOf('invalid_or_expired'))
-          return
-        }
-        if (declaredType === 'pair-begin') {
-          sendError(peer, 'bad_pair')
-          return
-        }
-        // 区分两种"看不懂"：帧名根本不认识（unknown_frame）与
-        // 名字对但形状不合法（bad_frame）。手机端会把它们当普通错误提示，
-        // 但排错时这个区别很值钱——前者是对端版本不对，后者是它发了坏数据。
-        //
-        // 分流判据是"`t` 是不是协议里已存在的帧名"（F1 那张冻结表 + resync/session-leave
-        // 两条后加的）：旧实现只看 `typeof t === 'string'`，于是 `{t:'enc'}`（缺 ciphertext）
-        // 这种"名字对、形状坏"的帧被报成 unknown_frame——与紧邻注释承诺的恰好相反，
-        // 排障时会把"对端发了坏数据"误读成"对端版本不对"。
-        if (typeof declaredType !== 'string') {
-          sendError(peer, 'bad_json')
-          return
-        }
-        if (!KNOWN_FRAME_NAMES.has(declaredType)) {
-          sendError(peer, 'unknown_frame', declaredType, declaredType)
-          return
-        }
-        // 帧名同时给 host（英文细节）与用户（`userHint`）："是哪条帧坏了"两边都用得上，
-        // 而英文那句只给 host（见 sendError 的注释）。
-        sendError(peer, 'bad_frame', `frame "${declaredType}" has an invalid shape`, declaredType)
-        return
-      }
-      if ((frame.t === 'enc' || frame.t === 'enc-batch') && !ciphertextsAreBase64(frame)) {
-        sendError(peer, 'bad_frame', 'ciphertext must be standard base64')
-        return
-      }
+      const frame = verdict.frame
       try {
         handleFrame(peer, frame)
       } catch (e) {
@@ -1086,12 +1071,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
       }
     })
     ws.on('error', (e: Error) => log.warn('socket error', { message: String(e?.message ?? e) }))
-  }
-
-  /** 密文字符集预检。Buffer 对非法 base64 是静默丢弃，所以这层必须在转发前把关。 */
-  function ciphertextsAreBase64(frame: { ciphertext?: string; items?: Array<{ ciphertext: string }> }): boolean {
-    const list = frame.items ?? (frame.ciphertext === undefined ? [] : [frame])
-    return list.every((item) => base64Text.safeParse(item.ciphertext).success)
   }
 
   // ── 清扫与保活 ──────────────────────────────────────────────────────
@@ -1297,7 +1276,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
         return
       }
       if (url.pathname === '/api/info') {
-        res.end(JSON.stringify({ publicUrl: config.publicUrl, protocol: 1 }))
+        // `PROTOCOL_VERSION` 而不是字面量 `1`：这条是无认证接口，
+        // 写死的版本号会在协议升版时静默变成一句谎话（小程序拿它判"能不能连"）。
+        res.end(JSON.stringify({ publicUrl: config.publicUrl, protocol: PROTOCOL_VERSION }))
         return
       }
       if (url.pathname === '/api/pair-status') {

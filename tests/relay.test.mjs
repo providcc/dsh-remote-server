@@ -1138,3 +1138,137 @@ test('socket 关闭的 peer-left 不许带 unpaired：D3（掉线不解除配对
     await ctx.close()
   }
 })
+
+// ── 七步分流已委托协议层（2026-10-17 接线）───────────────────────────
+//
+// 这一段的作用是**钉住那次重构**：入站分流原来在本文件里内联（七步 +
+// 手抄帧名表 + 手写密文字符集预检），现在换成协议层的
+// `classifyEndpointFrameText`。重构最典型的失败是"看起来一样、其实少了一条分支"，
+// 而那不会让任何既有用例变红 —— 所以下面逐条对**错误码**断言，
+// 并且每条都注明"少了它会怎样"。
+
+test('委托给 classify 之后，七步分流的错误码逐条不变', async () => {
+  const ctx = await startRelay()
+  try {
+    const client = await Peer.connect(ctx.url)
+    ctx.open.push(client)
+    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    await client.until((f) => f.t === 'hello-ok')
+
+    // ⚠️ 这里**不能**用 `until((f) => f.t === 'error')` 逐条断言：那个助手是
+    // `frames.find(match)`，它搜的是**整个缓冲区**，所以第二次调用会拿到第一次
+    // 那条 bad_json —— 症状是"判据红在一个与实现毫无关系的分支上"。
+    // 正确形状是：把七条坏帧**一次发完**，再按到达顺序读错误码序列。
+    // （这正是「判据红了先确认它测的是不是那一段」的另一个实例。）
+    const inputs = [
+      '{not json', // ① 解析失败
+      JSON.stringify('hello'), // ② 顶层不是对象
+      JSON.stringify({ noType: 1 }), // ③ 没有帧名
+      JSON.stringify({ t: 42 }), // ④ 帧名不是字符串
+      JSON.stringify({ t: 'heartbeat' }), // ⑤ 名字不认识
+      JSON.stringify({ t: 'enc', sessionId: 'c_000000000000' }), // ⑥ 名字对、形状坏
+      JSON.stringify({ t: 'enc', sessionId: 'c_000000000000', ciphertext: '%%%nope%%%' }), // ⑦ 密文字符集
+      JSON.stringify({ t: 'pair-begin' }), // ⑧ 主机侧的配对帧形状坏
+      JSON.stringify({ t: 'pair-begin-client' }), // ⑨ 客户端侧的配对帧形状坏
+    ]
+    for (const text of inputs) client.rawText(text)
+
+    // 收帧直到凑齐 9 条（8 条 error + 1 条 pair-fail），或超时。
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline && client.frames.filter((f) => f.t === 'error' || f.t === 'pair-fail').length < 9) {
+      await sleep(25)
+    }
+    const replies = client.frames.filter((f) => f.t === 'error' || f.t === 'pair-fail')
+    assert.equal(replies.length, 9, `实收 ${replies.length} 条：${JSON.stringify(replies).slice(0, 400)}`)
+    const codes = replies.map((f) => (f.t === 'pair-fail' ? `pair-fail:${f.reason}` : f.code))
+
+    // 逐条对应上面 ①…⑨。顺序即到达顺序 —— 同一批发出去、同一连接进来，
+    // 而 classify 是在**单线程**里逐帧判定的，所以到达顺序 = 判定顺序。
+    assert.deepEqual(
+      codes,
+      [
+        'bad_json', // ①
+        'bad_json', // ②
+        'bad_json', // ③
+        'bad_json', // ④
+        'unknown_frame', // ⑤ 「对端版本不对」
+        'bad_frame', // ⑥ 「对端发了坏数据」—— 与 ⑤ 的排错方向完全相反
+        'bad_frame', // ⑦ 密文那一层
+        'bad_pair', // ⑧ 那是**主机**的 bug，说给主机听更准确
+        'pair-fail:invalid_or_expired', // ⑨ 小程序只认那四个 reason 的中文文案（F6）
+      ],
+      `实得 ${JSON.stringify(codes)}`,
+    )
+    // ⑥ 与 ⑦ 都说得出"是哪条帧坏了"，而 ⑤ 说的是"版本不认识" ——
+    // 三者的措辞不同是有用的：它们指向三个完全不同的排查方向。
+    assert.match(replies[5].message ?? '', /enc/, '⑥ 要能看出是哪条帧坏了')
+    assert.match(replies[5].message ?? '', /heartbeat|enc/, '⑥ 的 userHint 带帧名')
+    assert.match(replies[6].message ?? '', /base64|不合法/, '⑦ 要说清是密文那一层')
+    assert.equal(ctx.relay.health().ok, true, '一堆坏帧之后进程仍然健康')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('enc-batch 的密文字符集也要逐项查（只查第一项是最容易漏的一条）', async () => {
+  const ctx = await startRelay()
+  try {
+    const client = await Peer.connect(ctx.url)
+    ctx.open.push(client)
+    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    await client.until((f) => f.t === 'hello-ok')
+
+    // 第一项合法、第二项非法：只查第一项的实现会**放行**，而对端解不开 → 静默黑洞
+    client.send({ t: 'enc-batch', sessionId: 'c_000000000000', items: [{ ciphertext: CIPHER }, { ciphertext: '%%%' }] })
+    const err = await client.until((f) => f.t === 'error')
+    assert.equal(err.code, 'bad_frame', '第二项非法也必须被拒：放行的话主机收到一条解不开的帧，且没有任何报错')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('/api/info 的 protocol 必须**引用** PROTOCOL_VERSION（判据只能查源码）', async () => {
+  // ⚠️ 这条判据**只能**查源码，不能查行为 —— 而这不是偷懒，是物理限制：
+  // `PROTOCOL_VERSION` 的值今天恰好是 1，所以"报 1"与"报 PROTOCOL_VERSION"
+  // 在运行时**完全无法区分**。变异验证（把源码改回字面量 1）证实了这一点：
+  // 行为判据全绿，而那正是它测不到的东西。
+  //
+  // 换成查源码之后，同一个变异会让它变红。代价是它只覆盖这一个文件的这几行
+  // —— 但这已经比"一个恒绿的断言"好得多，而后者是这个项目里更常见的形状。
+  const src = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8')
+  const line = src.split('\n').find((l) => l.includes("pathname === '/api/info'") || l.includes('publicUrl: config.publicUrl'))
+  assert.ok(line, '定位不到 /api/info 那行：判据本身失效了（它会静默放过一切）')
+  // 找到真正拼 JSON 的那一行（下一行），断言它带常量名
+  const lines = src.split('\n')
+  const at = lines.findIndex((l) => l.includes("pathname === '/api/info'"))
+  assert.ok(at > 0, '定位不到 /api/info 分支')
+  const body = lines.slice(at, at + 8).join('\n')
+  assert.match(
+    body,
+    /protocol: PROTOCOL_VERSION/,
+    '必须引用 PROTOCOL_VERSION：这条是**无认证**接口，而小程序拿它判"能不能连"，' +
+      '写死的版本号在协议升版时会静默变成一句谎话',
+  )
+  assert.ok(
+    !/protocol: 1\b/.test(body),
+    '不许写回字面量 1（变异验证证明：行为判据抓不住它，只有查源码能）',
+  )
+})
+
+test('转发的 enc 帧带 clientId，且 seq 原样透传（协议层 encToRelay 的接线）', async () => {
+  const ctx = await startRelay()
+  try {
+    const { host, client, conversationId } = await pairUp(ctx)
+    // 客户端上行不带 seq：中继**不改**它（重新编号是中继→客户端方向独有的）
+    client.send({ t: 'enc', sessionId: conversationId, ciphertext: CIPHER })
+    const got = await host.until((f) => f.t === 'enc')
+    assert.equal(got.sessionId, conversationId)
+    assert.equal(got.ciphertext, CIPHER, '密文必须逐字不变：任何加工都会让对侧解不开')
+    // pairUp 的 clientId 是那个函数的局部变量（Peer 上没有这个属性），
+    // 取值由 pairUp 的默认参数决定：'inst-1'。
+    assert.equal(got.clientId, 'inst-1', '上行必须补 clientId —— 主机按它做 per-client 回调')
+    assert.ok(!('seq' in got), '没带 seq 就不许凭空造一个：中继在��行方向不改它')
+  } finally {
+    await ctx.close()
+  }
+})
