@@ -5,6 +5,40 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [2.0.21] - 2026-10-08
+
+> 收口发布。本轮累计（按发现顺序，每一条都配了可变异验证的判据）：
+
+### 接线协议层
+
+- **入站七步分流委托 `classifyEndpointFrameText`**：原来本文件里有三份手抄
+  （16 个帧名的表、七步分流内联、`ciphertextsAreBase64`），同一份协议知识出现
+  两次，改协议要人肉同步而漏掉不编译失败。判据逐条对**错误码**断言（九条），
+  因为重构最典型的失败是"看起来一样、其实少了一条分支"，而那不会让任何
+  既有用例变红。
+- 两条手拼上行帧改用 `encToRelay` / `encBatchToRelay`。⚠️ 批量帧**不带**
+  `clientId` 而单帧带——这不是漏写，`encBatchFrame` 的 schema 里压根没这个
+  字段（F 契约）。注释与判据都钉住了这条不对称。
+- `/api/info` 的 `protocol: 1` → `PROTOCOL_VERSION`。⚠️ 这条判据**只能查源码**：
+  常量的值今天恰好是 1，行为上"报 1"与"报常量"无法区分——第一版写成行为判据时
+  变异验证直接证伪了它（全绿而测不到东西）。
+- `pair-fail` 带上**是哪一张**码失败的（可选字段，配合 wire 2.0.20）。
+  ⚠️ 入站分类器里 `bad_pair_claim` 那支**刻意不带**：那一帧形状已不合法，
+  从它身上读出来的 token 不可信，而主机会拿它去作废一张码。
+
+### 四个实测缺陷
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| 1 | ping 桶数**没有上界** | `Array.from({length}, () => new Set())` 是照单分配。实测 tick=1 + interval=3600000 → 360 万个 Set、RSS 664MB；interval=MAX_SAFE_INTEGER → `RangeError`，而 **loadConfig 报 0 条 problem**（异常在 createRelay 里）⇒ 照文档调 tick 就启动即崩 |
+| 2 | 观测面计数只增不减 | 每收一个 hello 就 +1、close 只 −1，而 re-hello 是设计内行为 ⇒ `peerProtocols.size===0`（"当前没有对端"）**永久失效**；未认证对端单连接发 500 个 hello 就能推高 500 |
+| 3 | re-hello 留下幽灵成员 | `clientGone` 刻意不动成员表（D3），但 re-hello 是**换身份**、旧 id 永不回来 ⇒ `markEmpty` 永远不打点 ⇒ **`sweepEmpty`（30 分钟回收空会话）完全失效** |
+| 4 | 「配对表满」逐帧写日志 | 绕过本文件自己建的三道闩锁。实测 400 个 pair-begin = 400 行 journald，而条数额度打满时中继**自己的**诊断日志会被一起抑制 |
+
+另修：`portNumber` 漏掉了 `integer()` 那条"只认十进制字面量"的纪律
+（`DRC_PORT=0x22` → 34，三种写法都 0 条 problem）。
+
+
 ## [2.0.16] - 2026-10-07
 
 四仓版本对齐（本节之前它只是个「代码未变」的号），本轮第一次给它装内容：
