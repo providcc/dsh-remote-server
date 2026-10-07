@@ -183,6 +183,51 @@ test('指南：镜像加速那条路必须说清"合并 daemon.json"与"核对 d
   )
 })
 
+test('指南：从 systemd 切过来时，属主改在停服务之后（顺序反了会静默丢配对记录）', () => {
+  // 2026-10-07 生产实测踩过。单元里有 StateDirectory=dsh-remote-control，
+  // systemd 会在**每次停止时**按 User= 把那个目录的属主改回去。所以：
+  //   chown 10001 → systemctl stop（改回 root）→ 起容器（uid 10001 读 root 的 600）
+  //   → EACCES → starting empty → 30 秒后落盘把空状态写回去 → **配对记录不可逆地没了**
+  // 最后一步是"从 systemd 切容器"这条路独有的，别的坑顶多让服务起不来。
+  const cut = GUIDE.slice(GUIDE.indexOf('## 与 systemd 并存'))
+  assert.match(
+    cut,
+    /systemctl stop[\s\S]{0,200}chown -R 10001:10001/,
+    '指南没有把「先 stop 再 chown」这个顺序写出来 —— 照着做的人会先 chown，' +
+      '然后被 StateDirectory 改回去，导致配对记录被空状态覆盖（2026-10-07 生产实测）',
+  )
+  // 反向：顺序反过来的写法不许出现在指南里（那是会丢数据的那个版本）。
+  //
+  // ⚠️ 这里**必须只看相邻两行**，不能用 `[\s\S]{0,N}` 跨段落匹配：这一节里本来就有
+  //   「切回 systemd」的代码块（`chown -R root:root`），而它离正确顺序块不到 200 字 ——
+  // 第一版写成 `[\s\S]{0,120}` 时**判据把指南自己写的正确内容也判成违规**，
+  // 那是最坏的一种红：会让人去改对的东西。
+  // 判据因装置错误而红，比判据红本身更贵。
+  const codeLines = cut.split('\n')
+  const badOrder = codeLines.some(
+    (line, i) => /chown -R 10001:10001/.test(line) && /systemctl stop/.test(codeLines[i + 1] || ''),
+  )
+  assert.equal(
+    badOrder,
+    false,
+    '指南的切容器代码块里，chown 写在 systemctl stop 的下一行 —— ' +
+      '这正是 2026-10-07 丢了一条会话的顺序（StateDirectory 会在 stop 时把属主改回去）',
+  )
+  // 判据本身：切完必看 stateRestored，而它与 conversations 的组合才是证据。
+  // 单看 conversations:0 会被读成"新配对还没建"，单看 stateRestored:0 会被忽略。
+  assert.match(
+    cut,
+    /stateRestored/,
+    '指南没提 stateRestored —— 它是"读不到旧状态、被当成空启动"唯一的可观测证据' +
+      '（/healthz 仍然是 ok:true，配对表面也正常）',
+  )
+  assert.match(
+    cut,
+    /unreadable|stateWriteFailures/,
+    '指南没提用日志/stateWriteFailures 交叉核对 —— 那是属主不对时的第二个信号',
+  )
+})
+
 test('docker compose config 在装了 compose 的机器上真的成立（没装就跳过，不假装通过）', async (t) => {
   const { spawnSync } = await import('node:child_process')
   const probe = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8' })
