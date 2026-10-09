@@ -38,7 +38,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.4",
     "@types/ws": "^8.5.12",
     "dsh-remote-wire": "2.0.21",
     "esbuild": "^0.28.2",
